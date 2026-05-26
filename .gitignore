@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.eggs/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Build / cache
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs / runtime data
+logs/
+*.log
+data/
+storage/
+
+# Routing eval artifacts (regenerate via tests/evaluate_routing.py)
+tests/routing_eval_*.json
+tests/routing_benchmark_*.json
+
+# Docker volumes (local)
+volumes/

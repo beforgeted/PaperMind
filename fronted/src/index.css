@@ -1,0 +1,77 @@
+:root {
+  --text: #3f3d4a;
+  --text-muted: #6b6a72;
+  --text-h: #0f0e14;
+  --bg: #f8f7fb;
+  --card: #ffffff;
+  --border: #e4e1ea;
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --accent-muted: rgba(79, 70, 229, 0.12);
+  --ok: #059669;
+  --warn: #d97706;
+  --err: #dc2626;
+  --radius: 10px;
+  --shadow: 0 1px 3px rgba(15, 14, 20, 0.08);
+  --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+  --sans: system-ui, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+}
+
+#root {
+  min-height: 100dvh;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0 0 0.5rem;
+  font-weight: 600;
+  color: var(--text-h);
+  letter-spacing: -0.02em;
+}
+
+h1 {
+  font-size: 1.5rem;
+}
+
+h2 {
+  font-size: 1.1rem;
+}
+
+h3 {
+  font-size: 0.95rem;
+}
+
+p {
+  margin: 0.35rem 0 0;
+}
+
+code,
+.mono {
+  font-family: var(--mono);
+  font-size: 0.88em;
+}

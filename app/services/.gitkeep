@@ -1,0 +1,4 @@
+# Phase 2+: minio_service.py, kafka_service.py
+# Phase 3:  docling_service.py
+# Phase 4:  embedding_service.py, elasticsearch_service.py
+# Phase 5:  retrieval_service.py

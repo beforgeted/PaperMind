@@ -1,0 +1,256 @@
+"""LangChain `ElasticsearchStore` wrapper for child chunks.
+
+Uses dense-vector kNN search for child chunks. We avoid Elasticsearch's native
+RRF hybrid mode because it is license-gated in some self-hosted distributions.
+
+The store is keyed by `settings.es_index_child` and stores the embedding plus
+the LangChain `Document.metadata`. `ensure_indices()` is idempotent and must be
+called once at startup so metadata filters use stable field types.
+"""
+
+from __future__ import annotations
+
+from typing import Optional
+
+from elasticsearch import Elasticsearch, NotFoundError
+from langchain_elasticsearch import DenseVectorStrategy, ElasticsearchStore
+
+from app.core.config import settings
+from app.core.logging import logger
+from app.services.embedding_service import get_embeddings
+
+
+def _build_es_client() -> Elasticsearch:
+    auth = None
+    if settings.es_username:
+        auth = (settings.es_username, settings.es_password or "")
+    return Elasticsearch(
+        hosts=settings.es_hosts_list,
+        basic_auth=auth,
+        request_timeout=30,
+    )
+
+
+def _child_mapping(dims: int) -> dict:
+    # Mapping the ElasticsearchStore would create dynamically, but with
+    # `metadata.task_id` pinned to keyword so filters work.
+    return {
+        "mappings": {
+            "properties": {
+                "text": {"type": "text"},
+                "vector": {
+                    "type": "dense_vector",
+                    "dims": dims,
+                    "index": True,
+                    "similarity": "cosine",
+                },
+                "metadata": {
+                    "properties": {
+                        "paper_id": {"type": "keyword"},
+                        "task_id": {"type": "keyword"},
+                        # ParentDocumentRetriever stamps each child with its
+                        # parent's docstore key under `doc_id` (the default
+                        # id_key on MultiVectorRetriever).
+                        "doc_id": {"type": "keyword"},
+                        "original_filename": {"type": "keyword"},
+                        "title": {"type": "keyword"},
+                        "section_title": {"type": "keyword"},
+                        "section_type": {"type": "keyword"},
+                        "subsection": {"type": "keyword"},
+                        "content_type": {"type": "keyword"},
+                        "entities": {"type": "keyword"},
+                        "keywords": {"type": "keyword"},
+                        "page": {"type": "integer"},
+                        "section_index": {"type": "integer"},
+                    }
+                },
+            }
+        }
+    }
+
+
+def _parent_mapping() -> dict:
+    return {
+        "mappings": {
+            "properties": {
+                "text": {"type": "text"},
+                "metadata": {
+                    "properties": {
+                        "paper_id": {"type": "keyword"},
+                        "task_id": {"type": "keyword"},
+                        "original_filename": {"type": "keyword"},
+                        "title": {"type": "keyword"},
+                        "section_title": {"type": "keyword"},
+                        "section_type": {"type": "keyword"},
+                        "subsection": {"type": "keyword"},
+                        "content_type": {"type": "keyword"},
+                        "entities": {"type": "keyword"},
+                        "keywords": {"type": "keyword"},
+                        "page": {"type": "integer"},
+                        "section_index": {"type": "integer"},
+                    }
+                },
+            }
+        }
+    }
+
+
+def _papers_mapping() -> dict:
+    """论文级索引 mapping（每篇论文 1 条）。"""
+    dims = get_embeddings().dim or settings.es_vector_dims
+    return {
+        "mappings": {
+            "properties": {
+                "paper_id": {"type": "keyword"},
+                "title": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+                "abstract": {"type": "text"},
+                "clean_abstract": {"type": "text"},
+                "abstract_summary": {"type": "text"},
+                "introduction_summary": {"type": "text"},
+                "method_summary": {"type": "text"},
+                "contribution_summary": {"type": "text"},
+                "experiment_summary": {"type": "text"},
+                "research_problem": {"type": "text"},
+                "method_name": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+                "authors": {"type": "keyword"},
+                "year": {"type": "keyword"},
+                "source_file": {"type": "keyword"},
+                "main_task": {"type": "text"},
+                "modality_tags": {"type": "keyword"},
+                "task_tags": {"type": "keyword"},
+                "method_tags": {"type": "keyword"},
+                "domain_tags": {"type": "keyword"},
+                "dataset_tags": {"type": "keyword"},
+                "metric_tags": {"type": "keyword"},
+                "is_image_related": {"type": "boolean"},
+                "is_frequency_related": {"type": "boolean"},
+                "paper_search_text": {"type": "text"},
+                "paper_search_vector": {
+                    "type": "dense_vector",
+                    "dims": dims,
+                    "index": True,
+                    "similarity": "cosine",
+                },
+                "matched_keywords": {"type": "keyword"},
+                "image_confidence": {"type": "float"},
+                "frequency_confidence": {"type": "float"},
+                "image_evidence": {"type": "object", "enabled": True},
+                "frequency_evidence": {"type": "object", "enabled": True},
+                "summary": {"type": "text"},
+                "created_at": {"type": "date"},
+                "updated_at": {"type": "date"},
+            }
+        }
+    }
+
+
+_vectorstore: Optional[ElasticsearchStore] = None
+_indices_ready = False
+
+
+def _metadata_mapping() -> dict:
+    return {
+        "properties": {
+            "metadata": {
+                "properties": {
+                    "paper_id": {"type": "keyword"},
+                    "section_title": {"type": "keyword"},
+                    "section_type": {"type": "keyword"},
+                    "subsection": {"type": "keyword"},
+                    "content_type": {"type": "keyword"},
+                    "entities": {"type": "keyword"},
+                    "keywords": {"type": "keyword"},
+                    "page": {"type": "integer"},
+                    "section_index": {"type": "integer"},
+                }
+            }
+        }
+    }
+
+
+def get_es_client() -> Elasticsearch:
+    """Bare ES client for low-level ops (indices admin, mget, delete_by_query)."""
+    return _build_es_client()
+
+
+def ensure_indices() -> None:
+    """Create both indices with strict metadata typing if they do not exist.
+
+    Safe to call repeatedly. Honours `embedding.dim` so the dense_vector
+    mapping matches whatever backend is active (DashScope 1024, local model
+    might differ).
+    """
+    global _indices_ready
+    if _indices_ready:
+        return
+
+    client = _build_es_client()
+    embeddings = get_embeddings()
+    dims = embeddings.dim or settings.es_vector_dims
+
+    if not client.indices.exists(index=settings.es_index_parent):
+        client.indices.create(index=settings.es_index_parent, body=_parent_mapping())
+        logger.info("Created index {}", settings.es_index_parent)
+    else:
+        client.indices.put_mapping(index=settings.es_index_parent, body=_metadata_mapping())
+    if not client.indices.exists(index=settings.es_index_child):
+        client.indices.create(
+            index=settings.es_index_child, body=_child_mapping(dims)
+        )
+        logger.info(
+            "Created index {} (dense_vector dims={})",
+            settings.es_index_child,
+            dims,
+        )
+    else:
+        client.indices.put_mapping(index=settings.es_index_child, body=_metadata_mapping())
+    if not client.indices.exists(index=settings.es_index_papers):
+        client.indices.create(index=settings.es_index_papers, body=_papers_mapping())
+        logger.info("Created index {}", settings.es_index_papers)
+    else:
+        client.indices.put_mapping(
+            index=settings.es_index_papers,
+            body=_papers_mapping()["mappings"],
+        )
+
+    _indices_ready = True
+
+
+def get_vectorstore() -> ElasticsearchStore:
+    """Singleton ElasticsearchStore configured for dense-vector retrieval."""
+    global _vectorstore
+    if _vectorstore is None:
+        # Pass the first host as es_url; ElasticsearchStore accepts a single
+        # URL or a pre-built client. Auth is left to env (basic_auth set on the
+        # bare client we use elsewhere — single-node Demo has security off).
+        es_url = settings.es_hosts_list[0] if settings.es_hosts_list else settings.es_hosts
+        _vectorstore = ElasticsearchStore(
+            es_url=es_url,
+            index_name=settings.es_index_child,
+            embedding=get_embeddings(),
+            strategy=DenseVectorStrategy(),
+        )
+        logger.info(
+            "ElasticsearchStore ready (url={}, index={}, strategy=dense_vector)",
+            es_url,
+            settings.es_index_child,
+        )
+    return _vectorstore
+
+
+def delete_by_task(task_id: str) -> None:
+    """Best-effort cleanup of a task's child + parent docs (used for retries / dev)."""
+    client = _build_es_client()
+    for idx in (settings.es_index_parent, settings.es_index_child):
+        try:
+            client.delete_by_query(
+                index=idx,
+                body={"query": {"term": {"metadata.task_id": task_id}}},
+                refresh=True,
+            )
+        except NotFoundError:
+            pass
+    try:
+        client.delete(index=settings.es_index_papers, id=task_id, refresh=True)
+    except NotFoundError:
+        pass
