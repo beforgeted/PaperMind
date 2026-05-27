@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from elasticsearch import Elasticsearch, NotFoundError
+from elasticsearch import ApiError, Elasticsearch, NotFoundError
 from langchain_elasticsearch import DenseVectorStrategy, ElasticsearchStore
 
 from app.core.config import settings
@@ -31,6 +31,42 @@ def _build_es_client() -> Elasticsearch:
     )
 
 
+def _chunk_order_metadata_fields() -> dict:
+    """Ordered parent/child linkage fields (parent + child indices share one mapping)."""
+    return {
+        "doc_id": {"type": "keyword"},
+        "parent_index": {"type": "integer"},
+        "parent_count": {"type": "integer"},
+        "prev_parent_id": {"type": "keyword"},
+        "next_parent_id": {"type": "keyword"},
+        "child_index": {"type": "integer"},
+        "child_count": {"type": "integer"},
+    }
+
+
+def _shared_chunk_metadata_fields() -> dict:
+    base = {
+        "paper_id": {"type": "keyword"},
+        "task_id": {"type": "keyword"},
+        "original_filename": {"type": "keyword"},
+        # 与 LangChain / 既有索引一致：title 为 text（带 keyword 子字段），不可改为纯 keyword
+        "title": {
+            "type": "text",
+            "fields": {"keyword": {"type": "keyword", "ignore_above": 256}},
+        },
+        "section_title": {"type": "keyword"},
+        "section_type": {"type": "keyword"},
+        "subsection": {"type": "keyword"},
+        "content_type": {"type": "keyword"},
+        "entities": {"type": "keyword"},
+        "keywords": {"type": "keyword"},
+        "page": {"type": "integer"},
+        "section_index": {"type": "integer"},
+    }
+    base.update(_chunk_order_metadata_fields())
+    return base
+
+
 def _child_mapping(dims: int) -> dict:
     # Mapping the ElasticsearchStore would create dynamically, but with
     # `metadata.task_id` pinned to keyword so filters work.
@@ -44,26 +80,7 @@ def _child_mapping(dims: int) -> dict:
                     "index": True,
                     "similarity": "cosine",
                 },
-                "metadata": {
-                    "properties": {
-                        "paper_id": {"type": "keyword"},
-                        "task_id": {"type": "keyword"},
-                        # ParentDocumentRetriever stamps each child with its
-                        # parent's docstore key under `doc_id` (the default
-                        # id_key on MultiVectorRetriever).
-                        "doc_id": {"type": "keyword"},
-                        "original_filename": {"type": "keyword"},
-                        "title": {"type": "keyword"},
-                        "section_title": {"type": "keyword"},
-                        "section_type": {"type": "keyword"},
-                        "subsection": {"type": "keyword"},
-                        "content_type": {"type": "keyword"},
-                        "entities": {"type": "keyword"},
-                        "keywords": {"type": "keyword"},
-                        "page": {"type": "integer"},
-                        "section_index": {"type": "integer"},
-                    }
-                },
+                "metadata": {"properties": _shared_chunk_metadata_fields()},
             }
         }
     }
@@ -74,22 +91,7 @@ def _parent_mapping() -> dict:
         "mappings": {
             "properties": {
                 "text": {"type": "text"},
-                "metadata": {
-                    "properties": {
-                        "paper_id": {"type": "keyword"},
-                        "task_id": {"type": "keyword"},
-                        "original_filename": {"type": "keyword"},
-                        "title": {"type": "keyword"},
-                        "section_title": {"type": "keyword"},
-                        "section_type": {"type": "keyword"},
-                        "subsection": {"type": "keyword"},
-                        "content_type": {"type": "keyword"},
-                        "entities": {"type": "keyword"},
-                        "keywords": {"type": "keyword"},
-                        "page": {"type": "integer"},
-                        "section_index": {"type": "integer"},
-                    }
-                },
+                "metadata": {"properties": _shared_chunk_metadata_fields()},
             }
         }
     }
@@ -148,24 +150,16 @@ _vectorstore: Optional[ElasticsearchStore] = None
 _indices_ready = False
 
 
-def _metadata_mapping() -> dict:
-    return {
-        "properties": {
-            "metadata": {
-                "properties": {
-                    "paper_id": {"type": "keyword"},
-                    "section_title": {"type": "keyword"},
-                    "section_type": {"type": "keyword"},
-                    "subsection": {"type": "keyword"},
-                    "content_type": {"type": "keyword"},
-                    "entities": {"type": "keyword"},
-                    "keywords": {"type": "keyword"},
-                    "page": {"type": "integer"},
-                    "section_index": {"type": "integer"},
-                }
-            }
-        }
-    }
+def _metadata_mapping_update() -> dict:
+    """Additive metadata fields only (safe on indices created before chunk ordering)."""
+    return {"properties": {"metadata": {"properties": _chunk_order_metadata_fields()}}}
+
+
+def _apply_metadata_mapping_update(client: Elasticsearch, index: str) -> None:
+    try:
+        client.indices.put_mapping(index=index, body=_metadata_mapping_update())
+    except ApiError as exc:
+        logger.warning("Index {} metadata mapping update skipped: {}", index, exc)
 
 
 def get_es_client() -> Elasticsearch:
@@ -192,7 +186,7 @@ def ensure_indices() -> None:
         client.indices.create(index=settings.es_index_parent, body=_parent_mapping())
         logger.info("Created index {}", settings.es_index_parent)
     else:
-        client.indices.put_mapping(index=settings.es_index_parent, body=_metadata_mapping())
+        _apply_metadata_mapping_update(client, settings.es_index_parent)
     if not client.indices.exists(index=settings.es_index_child):
         client.indices.create(
             index=settings.es_index_child, body=_child_mapping(dims)
@@ -203,15 +197,20 @@ def ensure_indices() -> None:
             dims,
         )
     else:
-        client.indices.put_mapping(index=settings.es_index_child, body=_metadata_mapping())
+        _apply_metadata_mapping_update(client, settings.es_index_child)
     if not client.indices.exists(index=settings.es_index_papers):
         client.indices.create(index=settings.es_index_papers, body=_papers_mapping())
         logger.info("Created index {}", settings.es_index_papers)
     else:
-        client.indices.put_mapping(
-            index=settings.es_index_papers,
-            body=_papers_mapping()["mappings"],
-        )
+        try:
+            client.indices.put_mapping(
+                index=settings.es_index_papers,
+                body=_papers_mapping()["mappings"],
+            )
+        except ApiError as exc:
+            logger.warning(
+                "Index {} mapping update skipped: {}", settings.es_index_papers, exc
+            )
 
     _indices_ready = True
 
