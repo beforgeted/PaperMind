@@ -19,7 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.agents.papermind_agent import answer_with_agent  # noqa: E402
+from app.agent.runtime import answer_with_agent  # noqa: E402
 
 QUESTIONS = [
     "帮我找几篇水下图像增强相关论文",

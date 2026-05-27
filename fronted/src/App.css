@@ -379,6 +379,30 @@
   color: #64748b;
 }
 
+.used-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.75rem;
+}
+
+.tool-tag {
+  border-radius: 6px;
+  padding: 0.12rem 0.48rem;
+  background: #e8e5ff;
+  color: #4f46e5;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.source-tag {
+  border-radius: 999px;
+  padding: 0.16rem 0.52rem;
+  background: #f0fdf4;
+  color: #166534;
+  font-size: 0.82rem;
+}
+
 .source-links {
   display: flex;
   flex-wrap: wrap;

@@ -51,8 +51,11 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("ES index-ensure at startup failed: {}", exc)
 
-    # Start the Kafka producer; this is required for /papers/upload to work.
-    await get_kafka_producer().start()
+    # Start the Kafka producer; upload will 503 until Kafka is available.
+    try:
+        await get_kafka_producer().start()
+    except Exception as exc:
+        logger.warning("Kafka producer start failed (upload will be unavailable): {}", exc)
 
     try:
         yield

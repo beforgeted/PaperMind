@@ -27,7 +27,7 @@ async def get_task_status(task_id: str) -> TaskRecord:
 
 
 @router.get(
-    "",
+    "/",
     response_model=list[TaskRecord],
     summary="List recent tasks (most-recently-updated first).",
 )

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import List, Literal, Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -125,14 +125,7 @@ class TaskRecord(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
-# ---------- Query / retrieval ----------
-
-class QueryRequest(BaseModel):
-    query: str = Field(..., min_length=1)
-    top_k: Optional[int] = None
-    # Optional: scope retrieval to a single paper. If absent, search across all.
-    task_id: Optional[str] = None
-
+# ---------- Retrieval result ----------
 
 class RetrievedChunk(BaseModel):
     parent_id: str
@@ -142,24 +135,20 @@ class RetrievedChunk(BaseModel):
     metadata: dict = {}
 
 
-class QueryResponse(BaseModel):
-    query: str
-    contexts: List[RetrievedChunk]
+# ---------- Agent chat ----------
 
-
-# ---------- LCEL answer ----------
-
-class AnswerRequest(BaseModel):
+class AgentChatRequest(BaseModel):
     query: str = Field(..., min_length=1)
     top_k: Optional[int] = None
     task_id: Optional[str] = None
-    use_agent: bool = False
 
 
-class AnswerResponse(BaseModel):
+class AgentChatResponse(BaseModel):
     query: str
     answer: str
-    contexts: List[RetrievedChunk]
+    contexts: List[RetrievedChunk] = Field(default_factory=list)
+    sources: List[dict] = Field(default_factory=list)
+    used_tools: List[str] = Field(default_factory=list)
 
 
 # ---------- Paper-level index / search ----------
@@ -225,24 +214,3 @@ class PaperSearchResult(BaseModel):
     evidence_chunks: List[str] = Field(default_factory=list)
 
 
-# --- Agent Routing ---
-
-class RouterDecision(BaseModel):
-    """Structured output from the LLM router node."""
-
-    route: Literal[
-        "paper_search", "paper_deep_search", "chunk_qa", "task_status", "paper_profile"
-    ]
-    confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence score 0–1")
-    reason: str = Field(default="", description="Human-readable routing rationale")
-
-
-class RoutingResult(BaseModel):
-    """Final routing decision returned to the API layer."""
-
-    route: Literal[
-        "paper_search", "paper_deep_search", "chunk_qa", "task_status", "paper_profile"
-    ]
-    confidence: float = 0.0
-    reason: str = ""
-    source: Literal["rule", "llm", "fallback"] = "rule"

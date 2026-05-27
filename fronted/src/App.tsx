@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { deletePaper, deletePapers, fetchHealth, fetchTask, listTasks, queryPapers, streamAnswerQuestion, uploadPaper } from "./api/papers"
-import type { HealthResponse, QueryResponseBody, TaskRecord } from "./types/api"
+import { chatWithAgent, deletePaper, deletePapers, fetchHealth, fetchTask, listTasks, uploadPaper } from "./api/papers"
+import type { AgentChatResponse, HealthResponse, TaskRecord } from "./types/api"
 import "./App.css"
 
 type PageType = "files" | "chat"
@@ -17,7 +17,9 @@ interface ChatMessage {
   question: string
   answer: string
   createdAt: string
-  contexts: QueryResponseBody["contexts"]
+  contexts: AgentChatResponse["contexts"]
+  sources: AgentChatResponse["sources"]
+  used_tools: AgentChatResponse["used_tools"]
 }
 
 /**
@@ -67,7 +69,7 @@ function formatTime(input: string): string {
 /**
  * 从检索片段元数据中提取论文来源名称。
  */
-function sourceLabel(ctx: QueryResponseBody["contexts"][number], index: number): string {
+function sourceLabel(ctx: AgentChatResponse["contexts"][number], index: number): string {
   const metadata = ctx.metadata
   const name =
     metadata.original_filename ??
@@ -107,9 +109,8 @@ function App() {
   const [scopeTaskId, setScopeTaskId] = useState("")
   const [topK, setTopK] = useState<number | "">(5)
   const [chatInput, setChatInput] = useState("")
-  const [queryBusy, setQueryBusy] = useState(false)
   const [answerBusy, setAnswerBusy] = useState(false)
-  const [queryResult, setQueryResult] = useState<QueryResponseBody | null>(null)
+  const [queryResult, setQueryResult] = useState<{ query: string; contexts: AgentChatResponse["contexts"] } | null>(null)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const chatListRef = useRef<HTMLDivElement | null>(null)
 
@@ -309,32 +310,7 @@ function App() {
   }
 
   /**
-   * 对输入内容执行纯检索，并显示命中片段。
-   */
-  const onSearch = async () => {
-    const query = chatInput.trim()
-    if (!query) {
-      setBanner("请输入查询内容。")
-      return
-    }
-    setQueryBusy(true)
-    setBanner(null)
-    try {
-      const result = await queryPapers({
-        query,
-        top_k: topKNum,
-        task_id: scopeTaskId.trim() || undefined,
-      })
-      setQueryResult(result)
-    } catch (error) {
-      setBanner(error instanceof Error ? error.message : String(error))
-    } finally {
-      setQueryBusy(false)
-    }
-  }
-
-  /**
-   * 发送消息并以流式方式追加回答。
+   * 通过 Agent 发送消息并获取回答。
    */
   const onSendMessage = async () => {
     const question = chatInput.trim()
@@ -353,40 +329,44 @@ function App() {
         answer: "",
         createdAt: new Date().toISOString(),
         contexts: [],
+        sources: [],
+        used_tools: [],
       },
     ])
     setChatInput("")
     try {
-      await streamAnswerQuestion(
-        {
-          query: question,
-          top_k: topKNum,
-          task_id: scopeTaskId.trim() || undefined,
-        },
-        (event) => {
-          if (event.type === "metadata") {
-            setQueryResult({
-              query: event.query,
-              contexts: event.contexts,
-            })
-            setChatMessages((prev) =>
-              prev.map((item) =>
-                item.id === messageId ? { ...item, contexts: event.contexts } : item,
-              ),
-            )
-            return
-          }
-          if (event.type === "delta") {
-            setChatMessages((prev) =>
-              prev.map((item) =>
-                item.id === messageId ? { ...item, answer: item.answer + event.text } : item,
-              ),
-            )
-          }
-        },
+      const result = await chatWithAgent({
+        query: question,
+        top_k: topKNum,
+        task_id: scopeTaskId.trim() || undefined,
+      })
+      setChatMessages((prev) =>
+        prev.map((item) =>
+          item.id === messageId
+            ? {
+                ...item,
+                answer: result.answer,
+                contexts: result.contexts,
+                sources: result.sources,
+                used_tools: result.used_tools,
+              }
+            : item,
+        ),
       )
+      if (result.contexts.length > 0) {
+        setQueryResult({
+          query: result.query,
+          contexts: result.contexts,
+        })
+      }
     } catch (error) {
-      setBanner(error instanceof Error ? error.message : String(error))
+      setChatMessages((prev) =>
+        prev.map((item) =>
+          item.id === messageId
+            ? { ...item, answer: `请求失败：${error instanceof Error ? error.message : String(error)}` }
+            : item,
+        ),
+      )
     } finally {
       setAnswerBusy(false)
     }
@@ -623,12 +603,28 @@ function App() {
                           <span>{formatTime(item.createdAt)}</span>
                         </div>
                         <div className={`chat-bubble chat-bubble--assistant answer-content ${item.answer ? "" : "is-streaming"}`}>
-                          {item.answer || "正在生成回答..."}
+                          {item.used_tools.length > 0 && (
+                            <div className="used-tools">
+                              {item.used_tools.map((tool) => (
+                                <span key={tool} className="tool-tag">{tool}</span>
+                              ))}
+                            </div>
+                          )}
+                          {item.answer || "正在调用工具..."}
+                          {item.sources.length > 0 && (
+                            <div className="source-links">
+                              {item.sources.map((src, index) => (
+                                <span key={index} className="source-tag">
+                                  来源: {typeof src.title === "string" ? src.title : `#${index + 1}`}
+                                </span>
+                              ))}
+                            </div>
+                          )}
                           {item.contexts.length > 0 && (
                             <div className="source-links">
                               {item.contexts.map((ctx, index) => (
                                 <a key={`${ctx.parent_id}-${index}`} href="#references">
-                                  来源#{index + 1}: {sourceLabel(ctx, index)}
+                                  引用#{index + 1}: {sourceLabel(ctx, index)}
                                 </a>
                               ))}
                             </div>
@@ -666,9 +662,6 @@ function App() {
                     </span>
                   </span>
                   <div className="composer-actions">
-                    <button type="button" className="btn btn--soft" disabled={queryBusy} onClick={() => void onSearch()}>
-                      {queryBusy ? "检索中..." : "仅检索"}
-                    </button>
                     <button type="submit" className="send-button" disabled={answerBusy || !chatInput.trim()}>
                       {answerBusy ? "..." : "➤"}
                     </button>

@@ -69,46 +69,19 @@ export interface RetrievedChunk {
   metadata: Record<string, unknown>
 }
 
-export interface QueryRequestBody {
+export interface AgentChatRequest {
   query: string
   top_k?: number
   task_id?: string
 }
 
-export interface QueryResponseBody {
-  query: string
-  contexts: RetrievedChunk[]
-}
-
-export interface AnswerRequestBody {
-  query: string
-  top_k?: number
-  task_id?: string
-}
-
-export interface AnswerResponseBody {
+export interface AgentChatResponse {
   query: string
   answer: string
   contexts: RetrievedChunk[]
+  sources: Record<string, unknown>[]
+  used_tools: string[]
 }
-
-export type AnswerStreamEvent =
-  | {
-      type: "metadata"
-      query: string
-      contexts: RetrievedChunk[]
-    }
-  | {
-      type: "delta"
-      text: string
-    }
-  | {
-      type: "done"
-    }
-  | {
-      type: "error"
-      message: string
-    }
 
 export interface HealthResponse {
   status: string

@@ -1,17 +1,13 @@
 import { requestJson } from "./http"
-import { getApiBase } from "../config"
 import SparkMD5 from "spark-md5"
 import type {
-  AnswerRequestBody,
-  AnswerResponseBody,
-  AnswerStreamEvent,
+  AgentChatRequest,
+  AgentChatResponse,
   DeleteTaskResult,
   DeleteTasksResponse,
   HealthResponse,
   MultipartUploadInitResponse,
   MultipartUploadStatusResponse,
-  QueryRequestBody,
-  QueryResponseBody,
   TaskRecord,
   UploadResponse,
 } from "../types/api"
@@ -182,10 +178,10 @@ export function listTasks(limit = 50): Promise<TaskRecord[]> {
 }
 
 /**
- * 混合检索 `POST /api/v1/papers/query`
+ * Agent 对话 `POST /api/v1/agent/chat`
  */
-export function queryPapers(body: QueryRequestBody): Promise<QueryResponseBody> {
-  return requestJson<QueryResponseBody>("/api/v1/papers/query", {
+export function chatWithAgent(body: AgentChatRequest): Promise<AgentChatResponse> {
+  return requestJson<AgentChatResponse>("/api/v1/agent/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -196,77 +192,3 @@ export function queryPapers(body: QueryRequestBody): Promise<QueryResponseBody> 
   })
 }
 
-/**
- * 检索 + 大模型回答 `POST /api/v1/papers/answer`
- */
-export function answerQuestion(body: AnswerRequestBody): Promise<AnswerResponseBody> {
-  return requestJson<AnswerResponseBody>("/api/v1/papers/answer", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      query: body.query,
-      top_k: body.top_k,
-      task_id: body.task_id || undefined,
-    }),
-  })
-}
-
-/**
- * 流式检索 + 大模型回答 `POST /api/v1/papers/answer/stream`
- */
-export async function streamAnswerQuestion(
-  body: AnswerRequestBody,
-  onEvent: (event: AnswerStreamEvent) => void,
-): Promise<void> {
-  const base = getApiBase()
-  const res = await fetch(`${base}/api/v1/papers/answer/stream`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      query: body.query,
-      top_k: body.top_k,
-      task_id: body.task_id || undefined,
-    }),
-  })
-  if (!res.ok) {
-    throw new Error(res.statusText || `HTTP ${res.status}`)
-  }
-  if (!res.body) {
-    throw new Error("浏览器不支持流式响应。")
-  }
-
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ""
-
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) {
-      break
-    }
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split("\n")
-    buffer = lines.pop() ?? ""
-    for (const line of lines) {
-      const trimmed = line.trim()
-      if (!trimmed) {
-        continue
-      }
-      const event = JSON.parse(trimmed) as AnswerStreamEvent
-      onEvent(event)
-      if (event.type === "error") {
-        throw new Error(event.message)
-      }
-    }
-  }
-
-  buffer += decoder.decode()
-  const trailing = buffer.trim()
-  if (trailing) {
-    const event = JSON.parse(trailing) as AnswerStreamEvent
-    onEvent(event)
-    if (event.type === "error") {
-      throw new Error(event.message)
-    }
-  }
-}

@@ -1,0 +1,1 @@
+"""PaperMind Agent — research assistant runtime, tools, and API endpoint."""
