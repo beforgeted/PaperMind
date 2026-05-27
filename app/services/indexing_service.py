@@ -1,13 +1,9 @@
-"""Markdown → ParentDocumentRetriever.add_documents.
+"""Markdown → token-sized parent/child chunks with ordered metadata.
 
-ParentDocumentRetriever does:
-  1. parent_splitter.split_documents(docs)        # parent chunks
-  2. child_splitter.split_documents(parent_chunks) # child chunks (vectorstore)
-  3. vectorstore.add_documents(child_chunks)
-  4. docstore.mset([(parent_id, parent_chunk)])
-
-We just hand it a single Document per paper and read back the resulting
-counts via the docstore + vectorstore for status reporting.
+Uses `chunk_indexing.index_documents` (parent docstore + child vectors) instead
+of LangChain's default `ParentDocumentRetriever.add_documents`, so each parent
+has `parent_index` / `prev_parent_id` / `next_parent_id` and each child has
+`child_index` + `doc_id`.
 """
 
 from __future__ import annotations
@@ -17,7 +13,7 @@ from dataclasses import dataclass
 from app.core.config import settings
 from app.core.logging import logger
 from app.core.schemas import ParsedDocument
-from app.services.retriever_service import get_parent_retriever
+from app.services.chunk_indexing import index_documents
 from app.services.vectorstore_service import ensure_indices, get_es_client
 from app.utils.chunking import parsed_to_documents
 
@@ -38,8 +34,7 @@ def run_indexing(parsed: ParsedDocument) -> IndexingStats:
         return IndexingStats(num_parents=0, num_children=0)
 
     ensure_indices()
-    retriever = get_parent_retriever()
-    retriever.add_documents(documents)
+    index_documents(documents)
 
     # Refresh + count what landed for this task.
     client = get_es_client()

@@ -50,8 +50,9 @@ services:
   redis:
     image: redis:7.2
     container_name: papermind-redis
+    # 宿主机若已有 Redis（如 Windows 3.2 占 6379），改映射 6380 避免冲突
     ports:
-      - "6379:6379"
+      - "6380:6379"
     volumes:
       - ./volumes/redis:/data
     command: redis-server --appendonly yes
@@ -68,6 +69,10 @@ services:
     image: apache/kafka:3.7.2
     hostname: broker
     container_name: papermind-kafka
+    # Docker Desktop 单独点「启动」时，容器内往往解析不了 hostname `broker`，
+    # 会导致 KRaft 启动报 UnknownHostException: broker。映射到本机环回即可。
+    extra_hosts:
+      - "broker:127.0.0.1"
     ports:
       - "9092:9092"   # PLAINTEXT_HOST：本机 Windows / 宿主机上的 API、Worker 用 localhost:9092
     environment:

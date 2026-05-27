@@ -192,3 +192,63 @@ export function chatWithAgent(body: AgentChatRequest): Promise<AgentChatResponse
   })
 }
 
+/**
+ * Agent 流式对话 `POST /api/v1/agent/chat/stream` → SSE
+ * 回调会依次收到 {type, ...} 事件对象。
+ */
+export async function chatWithAgentStream(
+  body: AgentChatRequest,
+  onEvent: (event: Record<string, unknown>) => void,
+): Promise<void> {
+  const base = (import.meta.env.VITE_API_BASE as string | undefined) ?? ""
+  const url = `${base}/api/v1/agent/chat/stream`
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      query: body.query,
+      top_k: body.top_k,
+      task_id: body.task_id || undefined,
+    }),
+  })
+
+  if (!res.ok) {
+    let message = res.statusText
+    try {
+      const err = (await res.json()) as { detail?: string }
+      if (err.detail) message = err.detail
+    } catch { /* ignore */ }
+    throw new Error(message)
+  }
+
+  const reader = res.body?.getReader()
+  if (!reader) throw new Error("Stream not supported")
+
+  const decoder = new TextDecoder()
+  let buffer = ""
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+
+    // Parse SSE frames
+    const lines = buffer.split("\n")
+    buffer = lines.pop() ?? ""
+
+    let eventType = ""
+    for (const line of lines) {
+      if (line.startsWith("event: ")) {
+        eventType = line.slice(7).trim()
+      } else if (line.startsWith("data: ")) {
+        try {
+          const data = JSON.parse(line.slice(6)) as Record<string, unknown>
+          data._event = eventType
+          onEvent(data)
+        } catch { /* skip malformed */ }
+      }
+    }
+  }
+}
+

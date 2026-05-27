@@ -42,6 +42,7 @@ def is_task_status_query(query: str) -> bool:
         "任务状态",
         "解析状态",
         "解析任务",
+        "解析",
         "处理进度",
         "task status",
         "task_id",

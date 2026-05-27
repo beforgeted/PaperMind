@@ -29,6 +29,12 @@ class RedisUploadState:
     def _chunks_key(self, upload_id: str) -> str:
         return f"upload:{upload_id}:chunks"
 
+    @staticmethod
+    def _hset_fields(client: Redis, key: str, fields: dict[str, str]) -> None:
+        """Write hash fields in a way compatible with Redis 3.x (single-field HSET)."""
+        for field, value in fields.items():
+            client.hset(key, field, value)
+
     def init_upload(
         self,
         *,
@@ -41,9 +47,10 @@ class RedisUploadState:
         file_md5: Optional[str],
     ) -> None:
         meta_key = self._meta_key(upload_id)
-        self._client.hset(
+        self._hset_fields(
+            self._client,
             meta_key,
-            mapping={
+            {
                 "task_id": task_id,
                 "filename": filename,
                 "object_name": object_name,

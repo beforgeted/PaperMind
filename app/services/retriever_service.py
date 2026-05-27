@@ -21,22 +21,15 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from app.core.config import settings
 from app.services.docstore_service import get_docstore
 from app.services.vectorstore_service import get_vectorstore
+from app.utils.token_splitting import child_text_splitter, parent_text_splitter
 
 
 def _parent_splitter() -> RecursiveCharacterTextSplitter:
-    return RecursiveCharacterTextSplitter(
-        chunk_size=settings.parent_chunk_size,
-        chunk_overlap=settings.parent_chunk_overlap,
-        separators=["\n\n", "\n", "。", ". ", " ", ""],
-    )
+    return parent_text_splitter()
 
 
 def _child_splitter() -> RecursiveCharacterTextSplitter:
-    return RecursiveCharacterTextSplitter(
-        chunk_size=settings.child_chunk_size,
-        chunk_overlap=settings.child_chunk_overlap,
-        separators=["。", "！", "？", ". ", "! ", "? ", " ", ""],
-    )
+    return child_text_splitter()
 
 
 _default: Optional[ParentDocumentRetriever] = None

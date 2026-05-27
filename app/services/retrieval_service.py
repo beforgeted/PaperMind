@@ -294,6 +294,50 @@ def _search_with_structural_fallback(
     return bm25_ranks, knn_ranks, section_filter
 
 
+def _append_next_parent_text(
+    doc: Document,
+    *,
+    next_by_id: dict[str, Document],
+) -> Document:
+    """Concatenate the linked next parent chunk when configured."""
+    if not settings.retrieve_include_next_parent:
+        return doc
+
+    next_id = (doc.metadata or {}).get("next_parent_id")
+    if not next_id:
+        return doc
+
+    next_doc = next_by_id.get(next_id)
+    if not next_doc or not next_doc.page_content:
+        return doc
+
+    metadata = dict(doc.metadata or {})
+    metadata["_included_next_parent_id"] = next_id
+    combined = f"{doc.page_content}\n\n{next_doc.page_content}"
+    return Document(page_content=combined, metadata=metadata)
+
+
+def _load_next_parent_docs(parents: list[Optional[Document]]) -> dict[str, Document]:
+    """Batch-fetch `next_parent_id` targets for expansion."""
+    next_ids: list[str] = []
+    seen: set[str] = set()
+    for doc in parents:
+        if doc is None:
+            continue
+        next_id = (doc.metadata or {}).get("next_parent_id")
+        if next_id and next_id not in seen:
+            seen.add(next_id)
+            next_ids.append(next_id)
+    if not next_ids:
+        return {}
+    loaded = get_docstore().mget(next_ids)
+    return {
+        parent_id: doc
+        for parent_id, doc in zip(next_ids, loaded)
+        if doc is not None
+    }
+
+
 def _retrieve_parent_documents_sync(
     query: str,
     *,
@@ -312,6 +356,7 @@ def _retrieve_parent_documents_sync(
 
     parent_ids = [hit.parent_id for hit in fused_hits]
     parents = get_docstore().mget(parent_ids)
+    next_by_id = _load_next_parent_docs(parents)
     out: list[Document] = []
     for hit, doc in zip(fused_hits, parents):
         if doc is None:
@@ -326,7 +371,8 @@ def _retrieve_parent_documents_sync(
             "used_section_filter": used_section_filter,
             "retrieval_query": retrieval_query,
         }
-        out.append(Document(page_content=doc.page_content, metadata=metadata))
+        base = Document(page_content=doc.page_content, metadata=metadata)
+        out.append(_append_next_parent_text(base, next_by_id=next_by_id))
     logger.debug(
         "Hybrid recall: {} parents (bm25={}, knn={}, task_id={}, sections={}, entities={}, expanded_query={})",
         len(out),
@@ -362,6 +408,10 @@ def _to_retrieved_chunk(doc, rank: int) -> RetrievedChunk:
             "entities": md.get("entities") or [],
             "content_type": md.get("content_type"),
             "retrieval_intent": md.get("_retrieval_intent"),
+            "parent_index": md.get("parent_index"),
+            "child_index": md.get("child_index"),
+            "next_parent_id": md.get("next_parent_id"),
+            "included_next_parent_id": md.get("_included_next_parent_id"),
         },
     )
 
@@ -377,6 +427,80 @@ async def retrieve_parent_documents(
         top_k=top_k,
         task_id=task_id,
     )
+
+
+async def _llm_expand_queries(query: str, n: int = 3) -> list[str]:
+    """LLM-based multi-query expansion for recall improvement.
+
+    Generates semantically equivalent variant queries. The original query is
+    always included as the first element.
+    """
+    from app.services.llm_service import get_llm
+    try:
+        llm = get_llm()
+        prompt = (
+            "你是检索查询扩展助手。生成语义等价或互补的多样化查询。使用中文，简短，避免标点。\n\n"
+            f"原始查询：{query}\n请给出{n}个不同表述的查询，每行一个。"
+        )
+        text = await llm.ainvoke(prompt)
+        content = text.content if hasattr(text, "content") else str(text)
+        lines = [ln.strip("- \t") for ln in content.splitlines() if ln.strip("- \t")]
+        return [query] + lines[:n]
+    except Exception as exc:
+        logger.debug("LLM query expansion failed: {}", exc)
+        return [query]
+
+
+def _should_trigger_mqe(query: str, chunks: list[RetrievedChunk]) -> bool:
+    """Decide whether to trigger multi-query expansion based on retrieval quality.
+
+    Triggers when:
+      1. Query is mixed Chinese-English (CJK + entity-like tokens present), OR
+      2. First retrieval top-3 scores are all below 0.5 (low confidence)
+    """
+    if not query:
+        return False
+
+    # Mixed-language: CJK present and entity-like tokens (model names, metrics) found
+    if _contains_cjk(query) and _extract_query_entities(query):
+        return True
+
+    # Low retrieval confidence
+    if chunks:
+        top_scores = [
+            chunk.score for chunk in chunks[:3] if chunk.score is not None
+        ]
+        if top_scores and max(top_scores) < 0.5:
+            return True
+
+    return False
+
+
+async def _mqe_retrieve(
+    query: str,
+    top_k: int | None = None,
+    task_id: str | None = None,
+) -> list[RetrievedChunk]:
+    """Multi-query expansion: expand → retrieve per variant → fuse via RRF."""
+    queries = await _llm_expand_queries(query)
+    if len(queries) <= 1:
+        return await hybrid_retrieve(query, top_k=top_k, task_id=task_id)
+
+    logger.debug("MQE expanding {} queries for: {}", len(queries), query[:80])
+
+    all_chunks: list[RetrievedChunk] = []
+    for variant in queries:
+        chunks = await hybrid_retrieve(variant, top_k=top_k, task_id=task_id)
+        all_chunks.extend(chunks)
+
+    # Fuse: deduplicate by parent_id, keep highest score
+    seen: dict[str, RetrievedChunk] = {}
+    for chunk in sorted(all_chunks, key=lambda c: c.score or 0.0, reverse=True):
+        if chunk.parent_id not in seen:
+            seen[chunk.parent_id] = chunk
+
+    fused = sorted(seen.values(), key=lambda c: c.score or 0.0, reverse=True)
+    return fused[:top_k or settings.final_top_k]
 
 
 async def hybrid_retrieve(

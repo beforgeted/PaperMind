@@ -24,6 +24,13 @@ SECTION_TYPES = {
 _HEADING_RE = re.compile(r"^(#{1,4})\s+(.+?)\s*$")
 _FIGURE_RE = re.compile(r"^\s*(fig\.?|figure)\s*\d+", re.IGNORECASE)
 _TABLE_RE = re.compile(r"^\s*table\s*\d+", re.IGNORECASE)
+_CJK_ASCII_BOUNDARY_RE = re.compile(
+    r"(?<=[一-鿿　-〿＀-￯])"
+    r"(?=[A-Za-z0-9])"
+    r"|"
+    r"(?<=[A-Za-z0-9])"
+    r"(?=[一-鿿　-〿＀-￯])"
+)
 _ENTITY_RE = re.compile(
     r"\b(?:[A-Z][A-Za-z]*Net|[A-Z]{2,}(?:-[A-Z0-9]+)*|[A-Z][a-z]+[A-Z][A-Za-z0-9]*|[A-Z]+[a-z]*\d+[A-Za-z0-9]*)\b"
 )
@@ -93,8 +100,10 @@ def classify_section(title: str, content: str = "") -> str:
 
 def extract_entities(text: str) -> list[str]:
     """Extract model names, metrics, datasets and acronym-like entities."""
-    entities = {match.group(0).strip("-") for match in _ENTITY_RE.finditer(text)}
-    entities.update(keyword for keyword in _COMMON_KEYWORDS if re.search(rf"\b{re.escape(keyword)}\b", text, re.IGNORECASE))
+    # Insert space at CJK-ASCII boundaries so \b word boundaries trigger
+    spaced = _CJK_ASCII_BOUNDARY_RE.sub(" ", text) if _CJK_ASCII_BOUNDARY_RE.search(text) else text
+    entities = {match.group(0).strip("-") for match in _ENTITY_RE.finditer(spaced)}
+    entities.update(keyword for keyword in _COMMON_KEYWORDS if re.search(rf"\b{re.escape(keyword)}\b", spaced, re.IGNORECASE))
     return sorted(entities, key=lambda item: (item.lower(), item))
 
 

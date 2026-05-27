@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { chatWithAgent, deletePaper, deletePapers, fetchHealth, fetchTask, listTasks, uploadPaper } from "./api/papers"
+import ReactMarkdown from "react-markdown"
+import remarkGfm from "remark-gfm"
+import { chatWithAgentStream, deletePaper, deletePapers, fetchHealth, fetchTask, listTasks, uploadPaper } from "./api/papers"
+import { SourcesPanel, type SourcesPanelMessage } from "./components/SourcesPanel"
 import type { AgentChatResponse, HealthResponse, TaskRecord } from "./types/api"
+import { normalizeCitationList } from "./utils/citations"
 import "./App.css"
 
 type PageType = "files" | "chat"
@@ -66,20 +70,6 @@ function formatTime(input: string): string {
   return date.toLocaleString("zh-CN", { hour12: false })
 }
 
-/**
- * 从检索片段元数据中提取论文来源名称。
- */
-function sourceLabel(ctx: AgentChatResponse["contexts"][number], index: number): string {
-  const metadata = ctx.metadata
-  const name =
-    metadata.original_filename ??
-    metadata.filename ??
-    metadata.source ??
-    metadata.object_name ??
-    ctx.parent_id
-  return typeof name === "string" && name.trim() ? name : `来源 ${index + 1}`
-}
-
 const menuItems: MenuItem[] = [
   { id: "chat", label: "聊天助手", icon: "C" },
   { id: "records", label: "聊天记录", icon: "R", disabled: true },
@@ -110,7 +100,8 @@ function App() {
   const [topK, setTopK] = useState<number | "">(5)
   const [chatInput, setChatInput] = useState("")
   const [answerBusy, setAnswerBusy] = useState(false)
-  const [queryResult, setQueryResult] = useState<{ query: string; contexts: AgentChatResponse["contexts"] } | null>(null)
+  const [sourcesPanelMessage, setSourcesPanelMessage] = useState<SourcesPanelMessage | null>(null)
+  const [sourcesPanelIndex, setSourcesPanelIndex] = useState(0)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const chatListRef = useRef<HTMLDivElement | null>(null)
 
@@ -310,7 +301,21 @@ function App() {
   }
 
   /**
-   * 通过 Agent 发送消息并获取回答。
+   * 打开指定消息的引用来源侧栏。
+   */
+  const openSourcesPanel = (item: ChatMessage) => {
+    setSourcesPanelMessage({
+      id: item.id,
+      question: item.question,
+      contexts: normalizeCitationList(item.contexts),
+      sources: Array.isArray(item.sources) ? item.sources : [],
+      used_tools: Array.isArray(item.used_tools) ? item.used_tools : [],
+    })
+    setSourcesPanelIndex(0)
+  }
+
+  /**
+   * 通过 Agent 发送消息并流式获取回答。
    */
   const onSendMessage = async () => {
     const question = chatInput.trim()
@@ -334,35 +339,50 @@ function App() {
       },
     ])
     setChatInput("")
-    try {
-      const result = await chatWithAgent({
-        query: question,
-        top_k: topKNum,
-        task_id: scopeTaskId.trim() || undefined,
-      })
+
+    const appendAnswer = (text: string) => {
       setChatMessages((prev) =>
         prev.map((item) =>
           item.id === messageId
-            ? {
-                ...item,
-                answer: result.answer,
-                contexts: result.contexts,
-                sources: result.sources,
-                used_tools: result.used_tools,
-              }
+            ? { ...item, answer: item.answer + text }
             : item,
         ),
       )
-      if (result.contexts.length > 0) {
-        setQueryResult({
-          query: result.query,
-          contexts: result.contexts,
-        })
-      }
-    } catch (error) {
+    }
+
+    const finalizeMessage = (data: Record<string, unknown>) => {
+      const contexts = normalizeCitationList(data.contexts)
+      const sources = Array.isArray(data.sources) ? (data.sources as AgentChatResponse["sources"]) : []
+      const used_tools = Array.isArray(data.used_tools) ? (data.used_tools as string[]) : []
       setChatMessages((prev) =>
         prev.map((item) =>
           item.id === messageId
+            ? { ...item, contexts, sources, used_tools }
+            : item,
+        ),
+      )
+      setSourcesPanelMessage((prev) =>
+        prev?.id === messageId ? { ...prev, contexts, sources, used_tools } : prev,
+      )
+    }
+
+    try {
+      await chatWithAgentStream(
+        { query: question, top_k: topKNum, task_id: scopeTaskId.trim() || undefined },
+        (event) => {
+          const type = event.type as string
+          if (type === "delta" && event.text) {
+            appendAnswer(String(event.text))
+          } else if (type === "done") {
+            finalizeMessage(event)
+          }
+          // status events (routing, planning) are received but not displayed yet
+        },
+      )
+    } catch (error) {
+      setChatMessages((prev) =>
+        prev.map((item) =>
+          item.id === messageId && !item.answer
             ? { ...item, answer: `请求失败：${error instanceof Error ? error.message : String(error)}` }
             : item,
         ),
@@ -403,76 +423,19 @@ function App() {
       </aside>
 
       <main className="main">
-        <header className="topbar">
-          {activePage === "chat" ? (
-            <div className="topbar-query">
-              <div className="topbar-query__scope">
-                <span className="label">检索范围</span>
-                <select
-                  value={scopeTaskId}
-                  onChange={(event) => setScopeTaskId(event.target.value)}
-                >
-                  <option value="">全部知识库（{searchableTasks.length} 篇已完成）</option>
-                  {searchableTasks.map((task) => (
-                    <option key={task.task_id} value={task.task_id}>
-                      {task.original_filename}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="topbar-query__topk">
-                <span className="label">top_k</span>
-                <input
-                  type="number"
-                  min={1}
-                  value={topK}
-                  onChange={(event) => {
-                    const value = event.target.value
-                    if (value === "") {
-                      setTopK("")
-                      return
-                    }
-                    setTopK(Math.max(1, Math.floor(Number(value)) || 1))
-                  }}
-                />
-              </div>
-              <button type="button" className="btn btn--soft" disabled={!scopeTaskId} onClick={() => void onRefreshOneTask()}>
-                刷新论文状态
-              </button>
-              <span className="scope-hint">
-                {selectedScope ? `当前仅检索：${selectedScope.original_filename}` : "默认检索全部已完成论文。"}
-              </span>
-            </div>
-          ) : (
-            <div className="topbar-query">
+        {activePage === "files" && (
+          <header className="topbar topbar--files">
+            <div className="topbar-query topbar-query--files">
               <input
                 type="text"
                 value={fileKeyword}
                 onChange={(event) => setFileKeyword(event.target.value)}
-                placeholder="检索知识库"
+                placeholder="检索知识库文件名"
                 autoComplete="off"
               />
             </div>
-          )}
-          <div className="topbar-actions">
-            <button type="button" className="icon-button" aria-label="搜索">
-              <span aria-hidden="true">⌕</span>
-            </button>
-            <button type="button" className="icon-button" aria-label="全屏">
-              <span aria-hidden="true">□</span>
-            </button>
-            <button type="button" className="icon-button" aria-label="高级设置">
-              <span aria-hidden="true">A</span>
-            </button>
-            <button type="button" className="icon-button" aria-label="知识库统计" onClick={() => setActivePage("files")}>
-              <span aria-hidden="true">B</span>
-            </button>
-            <button type="button" className="user-chip" onClick={() => void loadHealth()}>
-              <span className={healthErr ? "status-dot status-dot--err" : "status-dot"} aria-hidden="true" />
-              <span>admin</span>
-            </button>
-          </div>
-        </header>
+          </header>
+        )}
 
         {banner && <div className="error-box">{banner}</div>}
 
@@ -576,7 +539,7 @@ function App() {
             </div>
           </section>
         ) : (
-          <section className="chat-page">
+          <section className={`chat-page ${sourcesPanelMessage ? "chat-page--with-sources" : ""}`}>
             <div className="chat-shell">
               <div className="chat-list" ref={chatListRef}>
                 {chatMessages.length === 0 && (
@@ -603,33 +566,38 @@ function App() {
                           <span>{formatTime(item.createdAt)}</span>
                         </div>
                         <div className={`chat-bubble chat-bubble--assistant answer-content ${item.answer ? "" : "is-streaming"}`}>
-                          {item.used_tools.length > 0 && (
-                            <div className="used-tools">
-                              {item.used_tools.map((tool) => (
-                                <span key={tool} className="tool-tag">{tool}</span>
-                              ))}
-                            </div>
-                          )}
-                          {item.answer || "正在调用工具..."}
-                          {item.sources.length > 0 && (
-                            <div className="source-links">
-                              {item.sources.map((src, index) => (
-                                <span key={index} className="source-tag">
-                                  来源: {typeof src.title === "string" ? src.title : `#${index + 1}`}
-                                </span>
-                              ))}
-                            </div>
-                          )}
-                          {item.contexts.length > 0 && (
-                            <div className="source-links">
-                              {item.contexts.map((ctx, index) => (
-                                <a key={`${ctx.parent_id}-${index}`} href="#references">
-                                  引用#{index + 1}: {sourceLabel(ctx, index)}
-                                </a>
-                              ))}
-                            </div>
-                          )}
+                          {item.answer ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.answer}</ReactMarkdown> : "正在生成回答…"}
                         </div>
+                        {(item.answer || item.contexts.length > 0 || item.used_tools.length > 0) && (
+                          <div className="message-actions">
+                            <button
+                              type="button"
+                              className={`message-actions__btn message-actions__btn--sources ${
+                                sourcesPanelMessage?.id === item.id ? "is-active" : ""
+                              }`}
+                              onClick={() => {
+                                if (sourcesPanelMessage?.id === item.id) {
+                                  setSourcesPanelMessage(null)
+                                } else {
+                                  openSourcesPanel(item)
+                                }
+                              }}
+                              aria-expanded={sourcesPanelMessage?.id === item.id}
+                              aria-controls="sources-panel"
+                            >
+                              <span className="message-actions__icon" aria-hidden="true">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                                  <polyline points="14 2 14 8 20 8" />
+                                </svg>
+                              </span>
+                              来源
+                              {item.contexts.length > 0 && (
+                                <span className="message-actions__count">{item.contexts.length}</span>
+                              )}
+                            </button>
+                          </div>
+                        )}
                       </div>
                     </div>
                   </article>
@@ -655,12 +623,56 @@ function App() {
                   placeholder="给 PaperMind 发送消息"
                 />
                 <div className="composer-footer">
-                  <span className="connection-state">
-                    连接状态：
-                    <span className={healthErr ? "connection-state__bad" : "connection-state__ok"}>
-                      {healthErr ? "异常" : health ? "正常" : "检测中"}
+                  <div className="composer-footer__meta">
+                    <span className="connection-state">
+                      连接
+                      <span className={healthErr ? "connection-state__bad" : "connection-state__ok"}>
+                        {healthErr ? "异常" : health ? "正常" : "…"}
+                      </span>
                     </span>
-                  </span>
+                    <div className="composer-settings" aria-label="检索设置">
+                      <label className="composer-settings__field">
+                        <span className="composer-settings__label">范围</span>
+                        <select
+                          value={scopeTaskId}
+                          onChange={(event) => setScopeTaskId(event.target.value)}
+                          title={selectedScope?.original_filename ?? "全部已完成论文"}
+                        >
+                          <option value="">全部（{searchableTasks.length}）</option>
+                          {searchableTasks.map((task) => (
+                            <option key={task.task_id} value={task.task_id}>
+                              {task.original_filename}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="composer-settings__field composer-settings__field--topk">
+                        <span className="composer-settings__label">top_k</span>
+                        <input
+                          type="number"
+                          min={1}
+                          value={topK}
+                          onChange={(event) => {
+                            const value = event.target.value
+                            if (value === "") {
+                              setTopK("")
+                              return
+                            }
+                            setTopK(Math.max(1, Math.floor(Number(value)) || 1))
+                          }}
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className="composer-settings__refresh"
+                        disabled={!scopeTaskId}
+                        onClick={() => void onRefreshOneTask()}
+                        title="刷新当前论文解析状态"
+                      >
+                        刷新
+                      </button>
+                    </div>
+                  </div>
                   <div className="composer-actions">
                     <button type="submit" className="send-button" disabled={answerBusy || !chatInput.trim()}>
                       {answerBusy ? "..." : "➤"}
@@ -670,21 +682,12 @@ function App() {
               </form>
             </div>
 
-            {queryResult && (
-              <div className="panel reference-panel" id="references">
-                <h2>引用片段</h2>
-                {queryResult.contexts.length === 0 && <p className="muted">无命中片段</p>}
-                {queryResult.contexts.map((ctx, index) => (
-                  <article key={`${ctx.parent_id}-${index}`} className="chunk">
-                    <div className="chunk__meta">
-                      <span>来源#{index + 1}: {sourceLabel(ctx, index)}</span>
-                      <span>score: {ctx.score.toFixed(4)}</span>
-                    </div>
-                    <div>{ctx.parent_text}</div>
-                  </article>
-                ))}
-              </div>
-            )}
+            <SourcesPanel
+              message={sourcesPanelMessage}
+              selectedIndex={sourcesPanelIndex}
+              onSelectIndex={setSourcesPanelIndex}
+              onClose={() => setSourcesPanelMessage(null)}
+            />
           </section>
         )}
       </main>

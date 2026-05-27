@@ -19,6 +19,8 @@ class AppSettings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 8000
     log_level: str = "INFO"
+    log_dir: str = "logs"
+    log_retention_days: int = 30
 
     # ---- MinIO ----
     minio_endpoint: str = "localhost:9000"
@@ -52,11 +54,11 @@ class AppSettings(BaseSettings):
     dashscope_api_key: Optional[str] = None
     local_embedding_model: str = "Qwen/Qwen3-Embedding-0.6B"
 
-    # ---- Chunking ----
-    parent_chunk_size: int = 768
-    parent_chunk_overlap: int = 96
-    child_chunk_size: int = 220
-    child_chunk_overlap: int = 32
+    # ---- Chunking (sizes/overlaps are token counts; see token_splitting.py) ----
+    parent_chunk_size: int = 1024
+    parent_chunk_overlap: int = 150
+    child_chunk_size: int = 256
+    child_chunk_overlap: int = 30
 
     # ---- Retrieval ----
     # Recall depths for local BM25 + vector fusion. We do RRF in application
@@ -67,6 +69,8 @@ class AppSettings(BaseSettings):
     rrf_k: int = 60
     final_top_k: int = 5
     paper_search_top_k: int = 10
+    # When a child hit maps to a parent, also append that parent's `next_parent_id` text.
+    retrieve_include_next_parent: bool = True
 
     # ---- LLM (LCEL QA chain) ----
     llm_model: str = "qwen-plus"
