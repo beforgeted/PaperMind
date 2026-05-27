@@ -56,14 +56,26 @@ _FACTORIES: dict[str, ToolFactory] = {
     "get_workspace_state": ToolFactory(
         "get_workspace_state", "app.agent.tools.memory_tools", "get_workspace_state"
     ),
-    "draft_review_outline": ToolFactory(
-        "draft_review_outline", "app.agent.tools.writing_tools", "draft_review_outline"
+    "polish_academic_text": ToolFactory(
+        "polish_academic_text", "app.agent.tools.academic_writing_tools", "polish_academic_text"
     ),
-    "draft_review_section": ToolFactory(
-        "draft_review_section", "app.agent.tools.writing_tools", "draft_review_section"
+    "generate_review_outline": ToolFactory(
+        "generate_review_outline", "app.agent.tools.academic_writing_tools", "generate_review_outline"
     ),
-    "rewrite_academic_paragraph": ToolFactory(
-        "rewrite_academic_paragraph", "app.agent.tools.writing_tools", "rewrite_academic_paragraph"
+    "generate_review_section": ToolFactory(
+        "generate_review_section", "app.agent.tools.academic_writing_tools", "generate_review_section"
+    ),
+    "peer_review_draft": ToolFactory(
+        "peer_review_draft", "app.agent.tools.academic_writing_tools", "peer_review_draft"
+    ),
+    "list_available_skills": ToolFactory(
+        "list_available_skills", "app.agent.tools.skill_tools", "list_available_skills"
+    ),
+    "load_skill": ToolFactory(
+        "load_skill", "app.agent.tools.skill_tools", "load_skill"
+    ),
+    "use_skill_reference": ToolFactory(
+        "use_skill_reference", "app.agent.tools.skill_tools", "use_skill_reference"
     ),
 }
 
@@ -87,6 +99,9 @@ _PROFILES: dict[ToolProfile, tuple[str, ...]] = {
         "recall_memory",
         "update_workspace_state",
         "get_workspace_state",
+        "list_available_skills",
+        "load_skill",
+        "use_skill_reference",
     ),
     "writing": (
         "retrieve_evidence",
@@ -94,9 +109,13 @@ _PROFILES: dict[ToolProfile, tuple[str, ...]] = {
         "get_paper_profile",
         "remember_fact",
         "recall_memory",
-        "draft_review_outline",
-        "draft_review_section",
-        "rewrite_academic_paragraph",
+        "list_available_skills",
+        "load_skill",
+        "use_skill_reference",
+        "generate_review_outline",
+        "generate_review_section",
+        "polish_academic_text",
+        "peer_review_draft",
     ),
     "workflow": (
         "retrieve_evidence",
@@ -107,8 +126,13 @@ _PROFILES: dict[ToolProfile, tuple[str, ...]] = {
         "recall_memory",
         "update_workspace_state",
         "get_workspace_state",
-        "draft_review_outline",
-        "draft_review_section",
+        "list_available_skills",
+        "load_skill",
+        "use_skill_reference",
+        "generate_review_outline",
+        "generate_review_section",
+        "polish_academic_text",
+        "peer_review_draft",
     ),
     "all": tuple(_FACTORIES.keys()),
 }
