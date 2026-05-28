@@ -11,7 +11,7 @@ from typing import Optional
 
 from app.agent.tools.contracts import error_response, json_response
 from app.agent.tools.decorators import tool
-from app.services.llm_service import get_llm
+from app.services.llm import get_llm
 
 _REFERENCES_DIR = Path(__file__).resolve().parent / "references"
 

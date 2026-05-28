@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from langchain_core.documents import Document
 
-from app.services.retrieval_service import _append_next_parent_text, _load_next_parent_docs
+from app.services.retrieval import _append_next_parent_text, _load_next_parent_docs
 
 
 class RetrievalNextParentTests(unittest.TestCase):
@@ -25,7 +25,7 @@ class RetrievalNextParentTests(unittest.TestCase):
         self.assertIn("part two", expanded.page_content)
         self.assertEqual(expanded.metadata.get("_included_next_parent_id"), "next-1")
 
-    @patch("app.services.retrieval_service.get_docstore")
+    @patch("app.services.retrieval.get_docstore")
     def test_load_next_parent_docs_batch(self, mock_get_docstore):
         store = MagicMock()
         mock_get_docstore.return_value = store

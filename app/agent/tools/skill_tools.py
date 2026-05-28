@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from app.agent.tools.contracts import error_response, json_response
 from app.agent.tools.decorators import tool
-from app.services.skill_loader import SkillContent, get_skill_loader
+from app.services.skills import SkillContent, get_skill_loader
 
 
 def _content_to_result(content: SkillContent) -> dict:

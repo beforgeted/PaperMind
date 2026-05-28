@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m unittest tests.unit.test_langgraph_agent.GraphStructureTests.test_graph_has_required_nodes -v)",
+      "Bash(python -m unittest tests.unit.test_langgraph_agent tests.unit.test_comparison_workflow tests.unit.test_agent_first_architecture tests.unit.test_chunk_indexing -v)",
+      "Bash(python -c ' *)"
+    ]
+  }
+}

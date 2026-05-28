@@ -69,10 +69,35 @@ export interface RetrievedChunk {
   metadata: Record<string, unknown>
 }
 
+export interface SessionRecord {
+  session_id: string
+  title: string
+  created_at: string
+  updated_at: string
+  turn_count: number
+  status: string
+}
+
+export interface SessionHistoryMessage {
+  id: string
+  question: string
+  answer: string
+  created_at: string
+  used_tools: string[]
+}
+
+export interface SessionHistoryResponse {
+  session_id: string
+  title: string
+  messages: SessionHistoryMessage[]
+  source: string
+}
+
 export interface AgentChatRequest {
   query: string
   top_k?: number
   task_id?: string
+  session_id?: string
 }
 
 export interface AgentChatResponse {

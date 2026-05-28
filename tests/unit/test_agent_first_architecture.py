@@ -41,7 +41,7 @@ class ToolContractTests(unittest.TestCase):
 
 class MemoryStoreTests(unittest.TestCase):
     def test_memory_scopes_are_isolated_and_queryable(self):
-        from app.services.memory_store import JsonMemoryStore
+        from app.services.memory import JsonMemoryStore
 
         with tempfile.TemporaryDirectory() as tmp:
             store = JsonMemoryStore(Path(tmp) / "memory.json")
@@ -56,7 +56,7 @@ class MemoryStoreTests(unittest.TestCase):
         self.assertEqual(user_hits, [])
 
     def test_workspace_state_updates_do_not_remove_other_keys(self):
-        from app.services.memory_store import JsonMemoryStore
+        from app.services.memory import JsonMemoryStore
 
         with tempfile.TemporaryDirectory() as tmp:
             store = JsonMemoryStore(Path(tmp) / "memory.json")
@@ -71,7 +71,7 @@ class MemoryStoreTests(unittest.TestCase):
 
 class ToolRegistryTests(unittest.TestCase):
     def test_registry_profiles_are_lazy_and_named(self):
-        from app.agent.registry import available_profiles, get_tool_factories
+        from app.agent.tools.registry import available_profiles, get_tool_factories
 
         profiles = available_profiles()
         factories = get_tool_factories("research")

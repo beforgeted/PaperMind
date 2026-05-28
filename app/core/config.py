@@ -82,6 +82,35 @@ class AppSettings(BaseSettings):
     llm_route_temperature: float = 0.0
     llm_route_fallback_route: str = "chunk_qa"
 
+    # ---- Comparison workflow ----
+    comparison_min_evidence_per_aspect: int = 2
+    comparison_max_retry: int = 1
+    comparison_max_targets: int = 5
+    comparison_paper_resolve_min_score: float = 0.0
+    comparison_discovery_top_k: int = 3
+    comparison_evidence_top_k: int = 6
+
+    # ---- Summary (literature review) ----
+    summary_max_papers: int = 8
+    summary_max_sections: int = 3
+    summary_evidence_top_k: int = 3
+    summary_evidence_max_chars: int = 300
+    summary_outline_max_chars: int = 8000
+    summary_draft_max_chars: int = 6000
+    summary_polish_max_chars: int = 10000
+
+    # ---- Memory system (three-layer: working / semantic / episodic) ----
+    memory_es_semantic_index: str = "papermind_memories_semantic"
+    memory_es_episodic_index: str = "papermind_memories_episodic"
+    memory_working_max_items: int = 50
+    memory_working_ttl_seconds: int = 3600
+    memory_semantic_max_items: int = 10000
+    memory_episodic_max_items: int = 5000
+    memory_retrieval_top_k: int = 5
+    memory_consolidation_min_importance: float = 0.7
+    memory_forget_max_age_days: int = 90
+    memory_auto_encode_episodic: bool = True
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

@@ -33,7 +33,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-_GRAPH_BUILDER_PATH = _REPO_ROOT / "app" / "agent" / "graph" / "graph_builder.py"
+_GRAPH_BUILDER_PATH = _REPO_ROOT / "app" / "agent" / "builder.py"
 
 
 # ---------------------------------------------------------------------------
@@ -59,34 +59,38 @@ def _is_synthesizer_to_end_edge(node: ast.AST) -> bool:
 
 class AgentStateTests(unittest.TestCase):
     def test_state_has_required_fields(self):
-        from app.agent.graph.state import AgentState
+        from app.agent.state import AgentState
         fields = AgentState.__annotations__
         required = {"query", "intent", "intent_confidence", "final_answer", "used_tools"}
         for field in required:
             self.assertIn(field, fields, f"AgentState missing field: {field}")
 
     def test_state_has_routing_fields(self):
-        from app.agent.graph.state import AgentState
+        from app.agent.state import AgentState
         fields = AgentState.__annotations__
         routing = {"intent", "intent_confidence", "rule_matched", "routing_reason"}
         for field in routing:
             self.assertIn(field, fields, f"AgentState missing routing field: {field}")
 
     def test_state_has_handler_output_fields(self):
-        from app.agent.graph.state import AgentState
+        from app.agent.state import AgentState
         fields = AgentState.__annotations__
         handler = {"handler_answer", "handler_contexts", "handler_sources", "handler_used_tools"}
         for field in handler:
             self.assertIn(field, fields, f"AgentState missing handler field: {field}")
 
     def test_state_has_planner_fields(self):
-        from app.agent.graph.state import AgentState
+        from app.agent.state import AgentState
         fields = AgentState.__annotations__
         self.assertIn("plan", fields)
         self.assertIn("plan_summary", fields)
+        self.assertIn("plan_validated", fields)
+        self.assertIn("paper_candidates", fields)
+        self.assertIn("evidence_blocks", fields)
+        self.assertIn("trace", fields)
 
     def test_plan_step_structure(self):
-        from app.agent.graph.state import PlanStep
+        from app.agent.state import PlanStep
         step: PlanStep = {
             "step": 1,
             "action": "search_papers",
@@ -103,7 +107,7 @@ class AgentStateTests(unittest.TestCase):
 
 class IntentRouterRuleTests(unittest.TestCase):
     def setUp(self):
-        from app.agent.graph.intent_router import _rule_classify
+        from app.agent.routing.intent import _rule_classify
         self._rule_classify = _rule_classify
 
     # -- retrieval --
@@ -182,7 +186,7 @@ class IntentRouterEdgeCaseTests(unittest.TestCase):
     """Test intent routing for queries that resemble real-world PaperMind usage."""
 
     def setUp(self):
-        from app.agent.graph.intent_router import _rule_classify
+        from app.agent.routing.intent import _rule_classify
         self._classify = _rule_classify
 
     # -- Paper-specific queries: should be retrieval, not profile --
@@ -285,52 +289,42 @@ class IntentRouterEdgeCaseTests(unittest.TestCase):
 class PlannerCoverageTests(unittest.TestCase):
     """Test which intents get decomposition plans and which don't."""
 
-    def test_planner_prompts_exist_for_complex_intents(self):
-        """comparison, summary, writing get planner prompts."""
-        from app.agent.graph.planner import _PLANNER_PROMPTS
-        self.assertIn("comparison", _PLANNER_PROMPTS)
-        self.assertIn("summary", _PLANNER_PROMPTS)
-        self.assertIn("writing", _PLANNER_PROMPTS)
+    def test_comparison_uses_dedicated_prompt(self):
+        from app.agent.planning.planner import _COMPARISON_PLANNER_PROMPT
+        self.assertIn("paper_comparison", _COMPARISON_PLANNER_PROMPT)
+        self.assertIn("targets", _COMPARISON_PLANNER_PROMPT)
 
-    def test_planner_prompts_has_retrieval(self):
-        """retrieval now has a planner prompt for paper-specific queries."""
-        from app.agent.graph.planner import _PLANNER_PROMPTS
-        self.assertIn("retrieval", _PLANNER_PROMPTS,
-                      "retrieval should have a planner prompt for paper-specific query decomposition")
+    def test_generic_planner_prompts_cover_planner_intents(self):
+        from app.agent.planning.planner import _GENERIC_PLANNER_PROMPTS
+        for intent in ("retrieval", "summary"):
+            self.assertIn(intent, _GENERIC_PLANNER_PROMPTS)
 
-    def test_planner_prompts_missing_for_profile(self):
-        from app.agent.graph.planner import _PLANNER_PROMPTS
-        self.assertNotIn("profile", _PLANNER_PROMPTS)
+    def test_direct_intents_not_in_planner_prompts(self):
+        from app.agent.planning.planner import _GENERIC_PLANNER_PROMPTS
+        self.assertNotIn("chat", _GENERIC_PLANNER_PROMPTS)
+        self.assertNotIn("writing", _GENERIC_PLANNER_PROMPTS)
+        self.assertNotIn("profile", _GENERIC_PLANNER_PROMPTS)
 
-    def test_planner_prompts_missing_for_chat(self):
-        from app.agent.graph.planner import _PLANNER_PROMPTS
-        self.assertNotIn("chat", _PLANNER_PROMPTS)
-
-    def test_minimal_plan_for_retrieval(self):
-        """_minimal_plan now supports retrieval with search → retrieve → answer steps."""
-        from app.agent.graph.planner import _minimal_plan
-        plan = _minimal_plan("retrieval", "test query")
-        self.assertEqual(len(plan), 3)
-        actions = [p["action"] for p in plan]
-        self.assertIn("search_papers", actions)
-        self.assertIn("retrieve_evidence", actions)
-        self.assertIn("answer", actions)
-
-    def test_minimal_plan_for_comparison(self):
-        from app.agent.graph.planner import _minimal_plan
-        plan = _minimal_plan("comparison", "test")
-        self.assertEqual(len(plan), 3)
-        actions = [p["action"] for p in plan]
+    def test_minimal_agent_plan_for_retrieval(self):
+        from app.agent.schemas.plan import minimal_agent_plan
+        plan = minimal_agent_plan("retrieval", "test query")
+        self.assertEqual(plan.task_type, "paper_qa")
+        self.assertEqual(len(plan.steps), 2)
+        actions = [p["action"] for p in plan.steps]
         self.assertIn("search_papers", actions)
         self.assertIn("retrieve_evidence", actions)
 
-    def test_minimal_plan_for_summary(self):
-        from app.agent.graph.planner import _minimal_plan
-        plan = _minimal_plan("summary", "test")
-        self.assertEqual(len(plan), 4)
-        actions = [p["action"] for p in plan]
-        self.assertIn("search_papers", actions)
-        self.assertIn("draft_sections", actions)
+    def test_minimal_agent_plan_for_comparison(self):
+        from app.agent.schemas.plan import minimal_agent_plan
+        plan = minimal_agent_plan("comparison", "对比 A 和 B 的方法")
+        self.assertEqual(plan.task_type, "paper_comparison")
+        self.assertGreaterEqual(len(plan.aspects), 1)
+
+    def test_minimal_agent_plan_for_summary(self):
+        from app.agent.schemas.plan import minimal_agent_plan
+        plan = minimal_agent_plan("summary", "test")
+        self.assertEqual(plan.task_type, "literature_summary")
+        self.assertEqual(len(plan.steps), 3)
 
 
 # ---------------------------------------------------------------------------
@@ -338,41 +332,48 @@ class PlannerCoverageTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class RouteConditionalEdgeTests(unittest.TestCase):
-    def test_simple_intents_go_direct_to_handler(self):
-        from app.agent.graph.intent_router import route_from_router
-        for intent in ("retrieval", "profile", "chat"):
-            state = {"intent": intent}
-            result = route_from_router(state)
-            self.assertEqual(result, f"{intent}_handler",
-                             f"{intent} should route directly to handler (no planner)")
+    def test_chat_goes_to_chat_handler(self):
+        from app.agent.routing.intent import route_after_intent
 
-    def test_complex_intents_go_to_planner(self):
-        from app.agent.graph.intent_router import route_from_router
-        for intent in ("comparison", "summary", "writing"):
-            state = {"intent": intent}
-            result = route_from_router(state)
-            self.assertEqual(result, "planner",
-                             f"{intent} should route to planner")
+        state = {"intent": "chat", "intent_confidence": 0.95}
+        self.assertEqual(route_after_intent(state), "chat_handler")
 
-    def test_route_from_planner_all_intents(self):
-        from app.agent.graph.intent_router import route_from_planner
-        for intent in ("retrieval", "comparison", "summary", "profile", "writing", "chat"):
-            state = {"intent": intent}
-            result = route_from_planner(state)
-            self.assertEqual(result, f"{intent}_handler")
+    def test_planner_bound_intents_go_to_planner(self):
+        from app.agent.routing.intent import route_after_intent
 
-    def test_all_six_intents_mapped_in_route_from_router(self):
-        """Verify every intent branching node maps to a known handler."""
-        from app.agent.graph.intent_router import route_from_router
-        from app.agent.graph.handlers import HANDLERS
-        for intent in ("retrieval", "comparison", "summary", "profile", "writing", "chat"):
-            state = {"intent": intent}
-            target = route_from_router(state)
-            if intent in ("comparison", "summary", "writing"):
-                self.assertEqual(target, "planner")
-            else:
-                self.assertIn(target, HANDLERS,
-                              f"{target} from intent={intent} not in HANDLERS registry")
+        for intent in ("retrieval", "comparison", "summary"):
+            state = {"intent": intent, "intent_confidence": 0.9}
+            self.assertEqual(route_after_intent(state), "planner")
+
+    def test_chat_writing_profile_route_direct(self):
+        from app.agent.routing.intent import route_after_intent
+
+        expected = {
+            "chat": "chat_handler",
+            "writing": "writing_handler",
+            "profile": "profile_handler",
+        }
+        for intent, handler in expected.items():
+            state = {"intent": intent, "intent_confidence": 0.95}
+            self.assertEqual(route_after_intent(state), handler)
+
+    def test_low_confidence_direct_intents_still_go_planner(self):
+        from app.agent.routing.intent import route_after_intent
+
+        for intent in ("chat", "writing", "profile"):
+            state = {"intent": intent, "intent_confidence": 0.1}
+            self.assertEqual(route_after_intent(state), "planner")
+
+    def test_route_by_plan_type_comparison_subgraph(self):
+        from app.agent.routing.routes import route_by_plan_type
+
+        state = {"intent": "comparison", "plan": {"task_type": "paper_comparison"}}
+        self.assertEqual(route_by_plan_type(state), "comparison_subgraph")
+
+    def test_route_by_plan_type_retrieval(self):
+        from app.agent.routing.routes import route_by_plan_type
+        state = {"intent": "retrieval", "plan": {"task_type": "paper_qa"}}
+        self.assertEqual(route_by_plan_type(state), "retrieval_handler")
 
 
 # ---------------------------------------------------------------------------
@@ -383,54 +384,54 @@ class RetrievalIntentInferenceTests(unittest.TestCase):
     """Test _infer_intent, _expand_query_for_retrieval, _extract_query_entities."""
 
     def test_infer_method_section_from_zh(self):
-        from app.services.retrieval_service import _infer_intent
+        from app.services.retrieval import _infer_intent
         intent = _infer_intent("LCDNet网络架构是怎么设计的")
         self.assertIn("method", intent.section_types)
 
     def test_infer_experiment_section_from_zh(self):
-        from app.services.retrieval_service import _infer_intent
+        from app.services.retrieval import _infer_intent
         intent = _infer_intent("PSNR指标是多少实验结果如何")
         self.assertIn("experiment", intent.section_types)
 
     def test_infer_no_section_defaults_empty(self):
-        from app.services.retrieval_service import _infer_intent
+        from app.services.retrieval import _infer_intent
         intent = _infer_intent("LCDNet是什么")
         self.assertEqual(intent.section_types, [],
                          "Generic queries should not infer specific sections")
 
     def test_infer_multiple_sections(self):
-        from app.services.retrieval_service import _infer_intent
+        from app.services.retrieval import _infer_intent
         intent = _infer_intent("LCDNet的方法和实验结果对比")
         self.assertIn("method", intent.section_types)
         self.assertIn("experiment", intent.section_types)
 
     def test_infer_ablation_section(self):
-        from app.services.retrieval_service import _infer_intent
+        from app.services.retrieval import _infer_intent
         intent = _infer_intent("LCDNet的消融实验")
         self.assertIn("ablation", intent.section_types)
 
     # -- entity extraction --
     def test_extract_model_name_from_query(self):
-        from app.services.retrieval_service import _extract_query_entities
+        from app.services.retrieval import _extract_query_entities
         entities = _extract_query_entities("LCDNet的自适应对数变换是什么？")
         self.assertIn("LCDNet", entities,
                       f"LCDNet should be extracted as entity, got: {entities}")
 
     def test_extract_multiple_model_names(self):
-        from app.services.retrieval_service import _extract_query_entities
+        from app.services.retrieval import _extract_query_entities
         entities = _extract_query_entities("compare LCDNet and FUnIE-GAN")
         # At minimum LCDNet should be detected
         self.assertIn("LCDNet", entities)
 
     def test_extract_metric_names(self):
-        from app.services.retrieval_service import _extract_query_entities
+        from app.services.retrieval import _extract_query_entities
         entities = _extract_query_entities("PSNR SSIM指标")
         self.assertTrue(any("PSNR" in e for e in entities),
                         f"PSNR should be extracted, got: {entities}")
 
     # -- query expansion --
     def test_expand_zh_method_query(self):
-        from app.services.retrieval_service import _expand_query_for_retrieval, _RetrievalIntent
+        from app.services.retrieval import _expand_query_for_retrieval, _RetrievalIntent
         intent = _RetrievalIntent(section_types=["method"], entities=[])
         result = _expand_query_for_retrieval("LCDNet怎么设计的", intent)
         # Should expand with English terms
@@ -438,27 +439,27 @@ class RetrievalIntentInferenceTests(unittest.TestCase):
         self.assertIn("LCDNet", result)
 
     def test_expand_zh_experiment_query(self):
-        from app.services.retrieval_service import _expand_query_for_retrieval, _RetrievalIntent
+        from app.services.retrieval import _expand_query_for_retrieval, _RetrievalIntent
         intent = _RetrievalIntent(section_types=["experiment"], entities=[])
         result = _expand_query_for_retrieval("实验结果怎么样", intent)
         # Should expand with experiment-related terms
         self.assertIn("experiment", result.lower())
 
     def test_expand_section_type_added(self):
-        from app.services.retrieval_service import _expand_query_for_retrieval, _RetrievalIntent
+        from app.services.retrieval import _expand_query_for_retrieval, _RetrievalIntent
         intent = _RetrievalIntent(section_types=["method", "ablation"], entities=[])
         result = _expand_query_for_retrieval("怎么设计的", intent)
         self.assertIn("method", result.lower())
 
     def test_no_expand_for_pure_english(self):
-        from app.services.retrieval_service import _expand_query_for_retrieval, _RetrievalIntent
+        from app.services.retrieval import _expand_query_for_retrieval, _RetrievalIntent
         intent = _RetrievalIntent(section_types=["method"], entities=[])
         result = _expand_query_for_retrieval("how does LCDNet work", intent)
         # Pure English should not be expanded
         self.assertEqual(result, "how does LCDNet work")
 
     def test_expand_dedupes_terms(self):
-        from app.services.retrieval_service import _expand_query_for_retrieval, _RetrievalIntent
+        from app.services.retrieval import _expand_query_for_retrieval, _RetrievalIntent
         # method section_type and "method" trigger should not duplicate
         intent = _RetrievalIntent(section_types=["method"], entities=[])
         result = _expand_query_for_retrieval("LCDNet方法怎么设计", intent)
@@ -467,7 +468,7 @@ class RetrievalIntentInferenceTests(unittest.TestCase):
         self.assertLessEqual(count, 2, f"'method' appears {count} times, expected <= 2 (once in original + once expanded)")
 
     def test_expand_preserves_original_query(self):
-        from app.services.retrieval_service import _expand_query_for_retrieval, _RetrievalIntent
+        from app.services.retrieval import _expand_query_for_retrieval, _RetrievalIntent
         original = "LCDNet的自适应对数变换是什么？"
         intent = _RetrievalIntent(section_types=[], entities=["LCDNet"])
         result = _expand_query_for_retrieval(original, intent)
@@ -498,7 +499,7 @@ class HandlerToolUsageTests(unittest.TestCase):
         mock_qa.return_value = {"answer": "test answer", "contexts": []}
         mock_retrieve.return_value = []
 
-        from app.agent.graph.handlers.retrieval import retrieval_handler
+        from app.agent.handlers.retrieval import retrieval_handler
         result = await retrieval_handler({"query": "LCDNet的自适应对数变换是什么？"})
         used = result.get("handler_used_tools", [])
 
@@ -517,7 +518,7 @@ class HandlerToolUsageTests(unittest.TestCase):
         mock_qa.return_value = {"answer": "test", "contexts": []}
         mock_retrieve.return_value = []
 
-        from app.agent.graph.handlers.retrieval import retrieval_handler
+        from app.agent.handlers.retrieval import retrieval_handler
         result = await retrieval_handler({"query": "LCDNet论文的自适应对数变换是什么"})
 
         # The answer was generated without ever searching for the paper
@@ -532,7 +533,7 @@ class MQEConditionTests(unittest.TestCase):
     """Test _should_trigger_mqe and _llm_expand_queries logic."""
 
     def test_should_trigger_mqe_with_mixed_language(self):
-        from app.services.retrieval_service import _should_trigger_mqe
+        from app.services.retrieval import _should_trigger_mqe
         from app.core.schemas import RetrievedChunk
         # Mixed CJK + entity (model name) → should trigger
         self.assertTrue(
@@ -541,7 +542,7 @@ class MQEConditionTests(unittest.TestCase):
         )
 
     def test_should_trigger_mqe_with_low_scores(self):
-        from app.services.retrieval_service import _should_trigger_mqe
+        from app.services.retrieval import _should_trigger_mqe
         from app.core.schemas import RetrievedChunk
         chunks = [
             RetrievedChunk(parent_id="p1", parent_text="x", score=0.2),
@@ -554,7 +555,7 @@ class MQEConditionTests(unittest.TestCase):
         )
 
     def test_should_not_trigger_mqe_with_good_scores(self):
-        from app.services.retrieval_service import _should_trigger_mqe
+        from app.services.retrieval import _should_trigger_mqe
         from app.core.schemas import RetrievedChunk
         chunks = [
             RetrievedChunk(parent_id="p1", parent_text="x", score=0.85),
@@ -566,7 +567,7 @@ class MQEConditionTests(unittest.TestCase):
         )
 
     def test_should_not_trigger_mqe_pure_chinese_no_entities(self):
-        from app.services.retrieval_service import _should_trigger_mqe
+        from app.services.retrieval import _should_trigger_mqe
         from app.core.schemas import RetrievedChunk
         self.assertFalse(
             _should_trigger_mqe("什么是深度学习", []),
@@ -574,18 +575,18 @@ class MQEConditionTests(unittest.TestCase):
         )
 
     def test_should_trigger_mqe_empty_chunks_mixed_language(self):
-        from app.services.retrieval_service import _should_trigger_mqe
+        from app.services.retrieval import _should_trigger_mqe
         # Even with empty results, mixed language should trigger
         self.assertTrue(
             _should_trigger_mqe("什么是LCDNet的自适应对数变换", []),
         )
 
     def test_should_not_trigger_mqe_empty_query(self):
-        from app.services.retrieval_service import _should_trigger_mqe
+        from app.services.retrieval import _should_trigger_mqe
         self.assertFalse(_should_trigger_mqe("", []))
 
     def test_llm_expand_queries_returns_list_starting_with_original(self):
-        from app.services.retrieval_service import _llm_expand_queries
+        from app.services.retrieval import _llm_expand_queries
         import asyncio
         result = asyncio.run(_llm_expand_queries("LCDNet是什么", n=2))
         self.assertIsInstance(result, list)
@@ -601,7 +602,7 @@ class MQEHandlerIntegrationTests(unittest.TestCase):
     @patch("app.services.retrieval_service.hybrid_retrieve")
     async def test_direct_retrieve_triggers_mqe_for_mixed_language(self, mock_retrieve, mock_qa):
         from app.core.schemas import RetrievedChunk
-        from app.agent.graph.handlers.retrieval import _direct_retrieve
+        from app.agent.handlers.retrieval import _direct_retrieve
 
         # First retrieval: low quality
         mock_qa.return_value = {"answer": "insufficient", "contexts": []}
@@ -620,7 +621,7 @@ class MQEHandlerIntegrationTests(unittest.TestCase):
     @patch("app.services.retrieval_service.hybrid_retrieve")
     async def test_direct_retrieve_skips_mqe_for_pure_chinese(self, mock_retrieve, mock_qa):
         from app.core.schemas import RetrievedChunk
-        from app.agent.graph.handlers.retrieval import _direct_retrieve
+        from app.agent.handlers.retrieval import _direct_retrieve
 
         mock_qa.return_value = {"answer": "ok", "contexts": []}
         mock_retrieve.return_value = [
@@ -640,51 +641,51 @@ class MQEHandlerIntegrationTests(unittest.TestCase):
 
 class WritingHandlerHelpersTests(unittest.TestCase):
     def test_detect_abstract_section(self):
-        from app.agent.graph.handlers.writing import _detect_section_type
+        from app.agent.handlers.writing import _detect_section_type
         self.assertEqual(_detect_section_type("请润色这段摘要"), "abstract")
         self.assertEqual(_detect_section_type("polish this abstract please"), "abstract")
 
     def test_detect_introduction_section(self):
-        from app.agent.graph.handlers.writing import _detect_section_type
+        from app.agent.handlers.writing import _detect_section_type
         self.assertEqual(_detect_section_type("帮我改写引言部分"), "introduction")
         self.assertEqual(_detect_section_type("improve the introduction"), "introduction")
 
     def test_detect_methods_section(self):
-        from app.agent.graph.handlers.writing import _detect_section_type
+        from app.agent.handlers.writing import _detect_section_type
         self.assertEqual(_detect_section_type("润色实验设置这一段"), "methods")
         self.assertEqual(_detect_section_type("polish the methods section"), "methods")
 
     def test_detect_results_section(self):
-        from app.agent.graph.handlers.writing import _detect_section_type
+        from app.agent.handlers.writing import _detect_section_type
         self.assertEqual(_detect_section_type("改写实验结果"), "results")
         self.assertEqual(_detect_section_type("improve experiment results"), "results")
 
     def test_detect_discussion_section(self):
-        from app.agent.graph.handlers.writing import _detect_section_type
+        from app.agent.handlers.writing import _detect_section_type
         self.assertEqual(_detect_section_type("润色讨论部分"), "discussion")
 
     def test_detect_conclusion_section(self):
-        from app.agent.graph.handlers.writing import _detect_section_type
+        from app.agent.handlers.writing import _detect_section_type
         self.assertEqual(_detect_section_type("改写结论"), "conclusion")
 
     def test_detect_body_default(self):
-        from app.agent.graph.handlers.writing import _detect_section_type
+        from app.agent.handlers.writing import _detect_section_type
         self.assertEqual(_detect_section_type("请帮我改这段文字"), "body")
 
     def test_extract_text_removes_prefix(self):
-        from app.agent.graph.handlers.writing import _extract_text
+        from app.agent.handlers.writing import _extract_text
         result = _extract_text("润色：这是需要润色的文本内容，包含足够多的字符")
         self.assertIn("需要润色的文本", result)
         self.assertTrue(result.startswith("这是"), f"should strip prefix, got: {result}")
 
     def test_extract_text_short_returns_itself(self):
-        from app.agent.graph.handlers.writing import _extract_text
+        from app.agent.handlers.writing import _extract_text
         short = "这一句话太短"
         result = _extract_text(short)
         self.assertEqual(result, short)
 
     def test_extract_text_too_short_returns_empty(self):
-        from app.agent.graph.handlers.writing import _extract_text
+        from app.agent.handlers.writing import _extract_text
         self.assertEqual(_extract_text("hi"), "")
 
 
@@ -694,12 +695,13 @@ class WritingHandlerHelpersTests(unittest.TestCase):
 
 class SynthesizerTests(unittest.TestCase):
     def setUp(self):
-        from app.agent.graph.synthesizer import (
-            _add_source, _dedup_contexts, _dedup_sources, _source_from_context,
-        )
-        self._dedup_contexts = _dedup_contexts
-        self._dedup_sources = _dedup_sources
-        self._source_from_context = _source_from_context
+        from app.shared.dedup import dedup_by_key, source_from_context, context_key, source_key
+        from app.agent.synthesizer import _add_source
+
+        self._dedup_by_key = dedup_by_key
+        self._context_key = context_key
+        self._source_key = source_key
+        self._source_from_context = source_from_context
         self._add_source = _add_source
 
     # -- dedup contexts --
@@ -707,22 +709,22 @@ class SynthesizerTests(unittest.TestCase):
         ctx1 = {"paper_id": "p1", "parent_id": "doc1", "title": "Paper A", "content": "data1"}
         ctx2 = {"paper_id": "p1", "parent_id": "doc1", "title": "Paper A", "content": "data2"}
         ctx3 = {"paper_id": "p2", "parent_id": "doc2", "title": "Paper B", "content": "data3"}
-        result = self._dedup_contexts([ctx1, ctx2, ctx3])
+        result = self._dedup_by_key([ctx1, ctx2, ctx3], key_fn=self._context_key)
         self.assertEqual(len(result), 2)
 
     def test_dedup_contexts_handles_empty(self):
-        self.assertEqual(self._dedup_contexts([]), [])
-        self.assertEqual(self._dedup_contexts(None), [])
+        self.assertEqual(self._dedup_by_key([], key_fn=self._context_key), [])
+        self.assertEqual(self._dedup_by_key(None, key_fn=self._context_key), [])
 
     def test_dedup_contexts_handles_non_dict_items(self):
-        result = self._dedup_contexts([{"paper_id": "p1", "parent_id": "d1", "title": "A"}, "not_a_dict", 123])
+        result = self._dedup_by_key([{"paper_id": "p1", "parent_id": "d1", "title": "A"}, "not_a_dict", 123], key_fn=self._context_key)
         self.assertEqual(len(result), 1)
 
     def test_dedup_contexts_different_same_paper_different_parent(self):
         """Same paper, different parent docs should both be kept."""
         ctx1 = {"paper_id": "p1", "parent_id": "doc1", "title": "Paper A"}
         ctx2 = {"paper_id": "p1", "parent_id": "doc2", "title": "Paper A"}  # different parent
-        result = self._dedup_contexts([ctx1, ctx2])
+        result = self._dedup_by_key([ctx1, ctx2], key_fn=self._context_key)
         self.assertEqual(len(result), 2,
                          "Different parent_ids under same paper should both be kept")
 
@@ -731,12 +733,12 @@ class SynthesizerTests(unittest.TestCase):
         src1 = {"paper_id": "p1", "title": "Paper A", "score": 0.9}
         src2 = {"paper_id": "p1", "title": "Paper A", "score": 0.8}
         src3 = {"paper_id": "p2", "title": "Paper B", "score": 0.7}
-        result = self._dedup_sources([src1, src2, src3])
+        result = self._dedup_by_key([src1, src2, src3], key_fn=self._source_key)
         self.assertEqual(len(result), 2)
 
     def test_dedup_sources_handles_none(self):
-        """_dedup_sources now guards against None input."""
-        self.assertEqual(self._dedup_sources(None), [])
+        """dedup_by_key guards against None input."""
+        self.assertEqual(self._dedup_by_key(None, key_fn=self._source_key), [])
 
     # -- source from context --
     def test_source_from_context_full(self):
@@ -782,7 +784,7 @@ class SynthesizerTests(unittest.TestCase):
 
 class SynthesizerErrorTests(unittest.TestCase):
     async def test_synthesizer_returns_error_on_state_error(self):
-        from app.agent.graph.synthesizer import synthesizer_node
+        from app.agent.synthesizer import synthesizer_node
         result = await synthesizer_node({"error": "Something went wrong"})
         self.assertIn("处理出错", result["final_answer"])
         self.assertIn("Something went wrong", result["final_answer"])
@@ -831,21 +833,24 @@ class RuntimeBackwardCompatTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class HandlerRegistryTests(unittest.TestCase):
-    def test_all_six_handlers_registered(self):
-        from app.agent.graph.handlers import HANDLERS
+    def test_all_handlers_registered(self):
+        from app.agent.handlers import HANDLERS
         expected = {
-            "retrieval_handler", "profile_handler", "chat_handler",
-            "comparison_handler", "summary_handler", "writing_handler",
+            "retrieval_handler",
+            "profile_handler",
+            "chat_handler",
+            "summary_handler",
+            "writing_handler",
         }
         self.assertSetEqual(set(HANDLERS.keys()), expected)
 
     def test_all_handlers_are_callable(self):
-        from app.agent.graph.handlers import HANDLERS
+        from app.agent.handlers import HANDLERS
         for name, handler in HANDLERS.items():
             self.assertTrue(callable(handler), f"{name} should be callable")
 
     def test_all_handlers_are_async(self):
-        from app.agent.graph.handlers import HANDLERS
+        from app.agent.handlers import HANDLERS
         import asyncio
         for name, handler in HANDLERS.items():
             self.assertTrue(
@@ -873,7 +878,27 @@ class GraphStructureTests(unittest.TestCase):
                             add_node_names.append(f"<{arg.id}>")
         self.assertIn("intent_router", add_node_names)
         self.assertIn("planner", add_node_names)
+        self.assertIn("plan_validate", add_node_names)
+        self.assertIn("comparison_subgraph", add_node_names)
         self.assertIn("synthesizer", add_node_names)
+
+    def test_comparison_subgraph_has_workflow_nodes(self):
+        subgraph_path = _REPO_ROOT / "app" / "agent" / "workflows" / "comparison" / "__init__.py"
+        with subgraph_path.open(encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        add_node_names: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and hasattr(node.func, "attr"):
+                if node.func.attr == "add_node":
+                    for arg in node.args:
+                        if isinstance(arg, ast.Constant):
+                            add_node_names.append(arg.value)
+        for required in (
+            "paper_search_node",
+            "coverage_check_node",
+            "compare_node",
+        ):
+            self.assertIn(required, add_node_names)
 
     def test_graph_set_entry_point(self):
         with _GRAPH_BUILDER_PATH.open(encoding="utf-8") as f:
@@ -907,26 +932,26 @@ class PaperEntityExtractionTests(unittest.TestCase):
     """Test entity extraction from paper text — critical for model-name detection."""
 
     def test_extract_lcdnet(self):
-        from app.utils.paper_structure import extract_entities
+        from app.shared.paper_utils import extract_entities
         entities = extract_entities("We propose LCDNet for underwater image enhancement.")
         self.assertIn("LCDNet", entities)
 
     def test_extract_common_metrics(self):
-        from app.utils.paper_structure import extract_entities
+        from app.shared.paper_utils import extract_entities
         text = "We evaluate PSNR, SSIM, and UIQM on the EUVP dataset."
         entities = extract_entities(text)
         for metric in ("PSNR", "SSIM", "UIQM", "EUVP"):
             self.assertIn(metric, entities, f"{metric} should be extracted")
 
     def test_extract_compound_model_name(self):
-        from app.utils.paper_structure import extract_entities
+        from app.shared.paper_utils import extract_entities
         entities = extract_entities("FUnIE-GAN outperforms UGAN-P on LSUI.")
         # Known issue: _ENTITY_RE does not capture FUnIE pattern (upper-upper-lower-upper-upper)
         # Only GAN (via _COMMON_KEYWORDS), LSUI, and UGAN-P are captured
         self.assertIn("LSUI", entities)
 
     def test_extract_from_mixed_language(self):
-        from app.utils.paper_structure import extract_entities
+        from app.shared.paper_utils import extract_entities
         # After CJK boundary fix, model names (LCDNet) are extractable.
         # Plain English words (Adaptive, Logarithmic, Transformation) are
         # intentionally excluded by _ENTITY_RE — it targets model names, metrics, datasets.
@@ -934,7 +959,7 @@ class PaperEntityExtractionTests(unittest.TestCase):
         self.assertIn("LCDNet", entities)
 
     def test_extract_empty_string(self):
-        from app.utils.paper_structure import extract_entities
+        from app.shared.paper_utils import extract_entities
         entities = extract_entities("")
         self.assertEqual(entities, [])
 
@@ -1048,6 +1073,94 @@ class ConfigSanityTests(unittest.TestCase):
     def test_final_top_k_positive(self):
         from app.core.config import settings
         self.assertGreater(settings.final_top_k, 0)
+
+
+# ---------------------------------------------------------------------------
+# 18. Negation detection (NEW)
+# ---------------------------------------------------------------------------
+
+class NegationDetectionTests(unittest.TestCase):
+    def setUp(self):
+        from app.agent.routing.intent import _rule_classify
+        self._classify = _rule_classify
+
+    def test_negation_dont_compare(self):
+        intent, conf, reason = self._classify("不要帮我对比LCDNet和U-shape，我只想了解LCDNet的方法")
+        self.assertEqual(intent, "retrieval",
+                         f"Negation of comparison should route to retrieval, got {intent}. Reason: {reason}")
+
+    def test_negation_dont_write(self):
+        intent, conf, reason = self._classify("不要润色这段文字，帮我搜索有哪些论文")
+        self.assertEqual(intent, "profile",
+                         f"Negation of writing should route to profile, got {intent}. Reason: {reason}")
+
+    def test_negation_confidence_dropped(self):
+        intent, conf, reason = self._classify("不要对比 A 和 B")
+        # Should have lower confidence than a normal comparison query
+        self.assertLessEqual(conf, 0.7,
+                            f"Negated comparison should have low confidence, got {conf}. Reason: {reason}")
+
+    def test_no_negation_normal_comparison(self):
+        intent, conf, reason = self._classify("对比 LCDNet 和 U-shape 的方法")
+        self.assertEqual(intent, "comparison")
+        # "对比" and "方法" both match (comparison vs retrieval), ambiguity applies
+        self.assertGreater(conf, 0.3)
+
+
+# ---------------------------------------------------------------------------
+# 19. Dedup utility tests (NEW)
+# ---------------------------------------------------------------------------
+
+class DedupUtilityTests(unittest.TestCase):
+    def test_dedup_by_key_removes_duplicates(self):
+        from app.shared.dedup import dedup_by_key
+        items = [
+            {"paper_id": "p1", "parent_id": "d1", "title": "A", "text": "first"},
+            {"paper_id": "p1", "parent_id": "d1", "title": "A", "text": "second"},
+            {"paper_id": "p2", "parent_id": "d2", "title": "B", "text": "third"},
+        ]
+        result = dedup_by_key(items, key_fn=lambda x: (x.get("paper_id"), x.get("parent_id"), x.get("title")))
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["text"], "first")
+
+    def test_dedup_by_key_handles_empty(self):
+        from app.shared.dedup import dedup_by_key
+        self.assertEqual(dedup_by_key(None, key_fn=lambda x: ()), [])
+        self.assertEqual(dedup_by_key([], key_fn=lambda x: ()), [])
+
+    def test_dedup_by_key_skips_non_dict(self):
+        from app.shared.dedup import dedup_by_key
+        items = [{"paper_id": "p1", "title": "A"}, "not_a_dict", 123]
+        result = dedup_by_key(items, key_fn=lambda x: (x.get("paper_id"),))
+        self.assertEqual(len(result), 1)
+
+    def test_merge_deduped_combines_lists(self):
+        from app.shared.dedup import merge_deduped
+        list1 = [{"paper_id": "p1", "parent_id": "d1", "title": "A"}]
+        list2 = [{"paper_id": "p2", "parent_id": "d2", "title": "B"}]
+        list3 = [{"paper_id": "p1", "parent_id": "d1", "title": "A"}]  # duplicate
+        result = merge_deduped(list1, list2, list3)
+        self.assertEqual(len(result), 2)
+
+    def test_merge_deduped_handles_none_inputs(self):
+        from app.shared.dedup import merge_deduped
+        result = merge_deduped(None, [], [{"paper_id": "p1", "parent_id": "d1", "title": "A"}])
+        self.assertEqual(len(result), 1)
+
+
+# ---------------------------------------------------------------------------
+# 20. Config summary settings (NEW)
+# ---------------------------------------------------------------------------
+
+class ConfigSummarySettingsTests(unittest.TestCase):
+    def test_summary_settings_exist(self):
+        from app.core.config import settings
+        self.assertGreater(settings.summary_max_papers, 0)
+        self.assertGreater(settings.summary_max_sections, 0)
+        self.assertGreater(settings.summary_evidence_top_k, 0)
+        self.assertGreater(settings.summary_outline_max_chars, 0)
+        self.assertGreater(settings.summary_draft_max_chars, 0)
+        self.assertGreater(settings.summary_polish_max_chars, 0)
 
 
 if __name__ == "__main__":

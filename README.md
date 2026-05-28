@@ -34,8 +34,9 @@ flowchart TB
         Runtime --> Graph
         Graph --> Router
         Router --> Planner
-        Router --> Handlers
+        Router -->|"chat/writing/profile 直连"| Handlers
         Planner --> Handlers
+        Planner -->|"paper_comparison"| ComparisonWorkflow["Comparison Workflow<br/>9 nodes + Send + retry"]
     end
 
     %% ================= 能力服务层 =================
@@ -43,7 +44,12 @@ flowchart TB
         Retrieval["混合检索服务<br/>BM25 + kNN + RRF"]
         QA["RAG 问答服务"]
         PaperProfile["论文画像服务"]
-        Memory["记忆服务"]
+        subgraph MemSystem["记忆系统 (三层 + Redis 会话)"]
+            WorkingMem["Working Memory<br/>进程内存 · TTL 1h"]
+            SemanticMem["Semantic Memory<br/>ES dense_vector · 长期知识"]
+            EpisodicMem["Episodic Memory<br/>ES 时序 · 交互记录"]
+            SessionMem["Session Store<br/>Redis 滑动窗口 · 多轮恢复"]
+        end
         Skill["Skill 扩展服务<br/>写作 / 润色 / 评审"]
     end
 
@@ -63,7 +69,7 @@ flowchart TB
     subgraph L6["基础设施层"]
         ES["Elasticsearch<br/>父子块索引 / 向量检索"]
         MinIO["MinIO<br/>PDF / Markdown 存储"]
-        Redis["Redis<br/>任务状态 / 分片上传 / 缓存"]
+        Redis["Redis<br/>会话记忆 / 上传状态 / 缓存"]
     end
 
     %% ================= 主链路 =================
@@ -75,14 +81,19 @@ flowchart TB
     Handlers --> Retrieval
     Handlers --> QA
     Handlers --> PaperProfile
-    Handlers --> Memory
+    Handlers --> WorkingMem
+    Handlers --> SemanticMem
+    Handlers --> EpisodicMem
+    Handlers --> SessionMem
     Handlers --> Skill
+    ComparisonWorkflow --> Retrieval
+    ComparisonWorkflow --> PaperProfile
 
     %% 跨层数据流（节点直连，兼容 GitHub Mermaid）
     Retrieval --> ES
     QA --> ES
     PaperProfile --> ES
-    Memory --> Redis
+    SessionMem --> Redis
     Chunker --> ES
     Worker --> MinIO
     PaperAPI --> Redis
@@ -93,8 +104,9 @@ flowchart TB
 - **Agent-first**：所有问答请求统一走 Agent，由 Agent 自主选择工具、获取证据、组织回答。
 - **Skill 扩展**：Agent 可动态加载外部 Claude Code Skill 包（nature-skills、academic-research-skills），获取学术写作、润色、评审等领域的专业规则。
 - **RAG**：子块向量检索 → 父块回溯（可选拼接 `next_parent_id` 邻接父块）；证据能力以 Tool / Handler 形式被 Agent 调用。
-- **LangGraph**：`intent_router` →（可选）`planner` → `retrieval|profile|chat|…` handler → `synthesizer` 生成答案。
-- **记忆**：记忆负责稳定读写，不负责判断事实真伪。Agent 通过 `remember_fact` / `recall_memory` 工具自行管理。
+- **LangGraph**：`intent_router` →（`chat` / `writing` / `profile` 直连 handler，跳过 planner）→ 其余 intent `planner` → `plan_validate` → 按 `task_type` 路由；**论文对比**走独立 `comparison_subgraph`（`targets`×`aspects` + Send 并行 + `coverage_check` + 缺失项定向重试），其余 intent 走 handler → `synthesizer`。
+- **三层记忆**：Working（进程内存 TTL 1h）→ Semantic（ES 向量检索，长期知识）→ Episodic（ES 时序，交互记录）。生命周期覆盖 encode → store → retrieve → consolidate → forget，检索采用 `向量相似度 × 时间衰减 × 重要性加权`。
+- **Redis 会话记忆**：双 Key 结构（`session:{id}` + `history:{id}`），滑动窗口 20 轮，解耦 HTTP/WebSocket 连接与对话状态。同一 `session_id` 跨请求恢复完整上下文，支持网络断开重连后多轮连续推理。
 - **Agent 只做调度与汇总**：理解用户目标、选择工具、组织答案，论文事实必须来自工具返回结果。
 
 ## 目录结构
@@ -109,37 +121,81 @@ flowchart TB
 │   │   ├── upload.py                    # PDF / multipart upload
 │   │   └── tasks.py                     # task status & delete
 │   ├── agent/
-│   │   ├── __init__.py
 │   │   ├── api.py                       # POST /api/v1/agent/chat endpoint
 │   │   ├── runtime.py                   # LangGraph entry, sync + SSE stream
-│   │   ├── graph/                       # intent_router, planner, handlers, synthesizer
+│   │   ├── state.py                     # AgentState TypedDict
+│   │   ├── builder.py                   # StateGraph assembly
+│   │   ├── synthesizer.py              # final answer dedup + format
 │   │   ├── prompts.py                   # system prompt sections
 │   │   ├── session.py                   # request/session constraints
-│   │   ├── registry.py                  # lazy tool registry (5 profiles)
-│   │   ├── skills/                      # installed external skill packs
-│   │   │   ├── nature-skills/           # nature-polishing, nature-writing
-│   │   │   └── academic-research-skills/# academic-paper, academic-paper-reviewer
-│   │   └── tools/
-│   │       ├── contracts.py             # unified ToolResult JSON contract
-│   │       ├── decorators.py            # LangChain @tool shim
-│   │       ├── paper_serializers.py     # result formatting helpers
-│   │       ├── rag_tools.py             # retrieve_evidence / answer_with_rag
-│   │       ├── paper_search_tools.py    # paper discovery / profile tools
-│   │       ├── task_tools.py            # get_task_status
-│   │       ├── memory_tools.py          # session/user/project/workspace memory
-│   │       ├── academic_writing_tools.py# LLM-powered review/polish/peer-review
-│   │       ├── skill_tools.py           # list_skills / load_skill / use_skill_reference
-│   │       └── references/              # curated writing rule extracts for tools
+│   │   ├── routing/
+│   │   │   ├── intent.py                # 两层意图路由 (rule + LLM)
+│   │   │   └── routes.py               # 图条件边路由
+│   │   ├── planning/
+│   │   │   ├── planner.py              # 结构化任务拆解
+│   │   │   └── validator.py            # Plan 归一化 + 降级
+│   │   ├── handlers/
+│   │   │   ├── chat.py                  # 闲聊 / 能力说明
+│   │   │   ├── profile.py              # 论文发现 / 筛选
+│   │   │   ├── retrieval.py            # RAG 问答 (plan-driven + MQE)
+│   │   │   ├── summary.py              # 文献综述生成
+│   │   │   └── writing.py              # 学术润色 / 同行评审
+│   │   ├── workflows/                    # 多节点子工作流
+│   │   │   └── comparison/              # 论文对比 (9 nodes + Send + coverage)
+│   │   │       ├── __init__.py          # build_comparison_subgraph
+│   │   │       ├── nodes.py             # 全部节点
+│   │   │       ├── dispatch.py          # Send fan-out
+│   │   │       └── routing.py           # coverage → retry
+│   │   ├── schemas/
+│   │   │   ├── plan.py                  # 结构化 AgentPlan (targets / aspects)
+│   │   │   ├── types.py                 # PlanStep TypedDict
+│   │   │   └── reducers.py             # 并行 state 合并
+│   │   ├── tools/
+│   │   │   ├── contracts.py             # unified ToolResult JSON contract
+│   │   │   ├── decorators.py            # LangChain @tool shim
+│   │   │   ├── registry.py              # lazy tool registry (5 profiles)
+│   │   │   ├── rag.py                   # retrieve_evidence / answer_with_rag
+│   │   │   ├── papers.py               # paper discovery / profile tools
+│   │   │   ├── tasks.py                # get_task_status
+│   │   │   ├── memory.py               # session/user/project/workspace memory
+│   │   │   ├── writing.py              # LLM-powered review/polish/peer-review
+│   │   │   └── skills.py               # list_skills / load_skill / use_skill_reference
+│   │   └── skills/                      # installed external skill packs
 │   ├── services/
-│   │   ├── retrieval_service.py         # BM25 + vector kNN + app-side RRF
-│   │   ├── qa_service.py                # retrieve -> generate RAG chain
-│   │   ├── skill_loader.py              # SKILL.md parser + skill cache
-│   │   ├── vectorstore_service.py       # ES indices + dense_vector child store
-│   │   ├── chunk_indexing.py            # ordered parent/child index + docstore
-│   │   ├── memory_store.py              # JSON-backed agent memory store
-│   │   └── ...                          # MinIO, Kafka, Redis, Docling, embedding
+│   │   ├── llm.py                       # LLM factory (Qwen, streaming)
+│   │   ├── qa.py                        # RAG 问答链
+│   │   ├── retrieval.py                 # BM25 + kNN + RRF + MQE
+│   │   ├── indexing.py                  # Parent-Child 切分 + ES 入库
+│   │   ├── docling.py                   # Docling PDF 解析
+│   │   ├── skills.py                    # SKILL.md parser + cache
+│   │   ├── memory/                       # 三层记忆系统 + Redis 会话
+│   │   │   ├── models.py                # MemoryItem, MemoryType, MemoryScope
+│   │   │   ├── config.py                # MemoryConfig (TTL, 容量, 衰减)
+│   │   │   ├── working.py               # WorkingMemory (内存 + TTL)
+│   │   │   ├── semantic.py              # SemanticMemory (ES 向量检索)
+│   │   │   ├── episodic.py              # EpisodicMemory (ES 时序)
+│   │   │   ├── session_store.py         # Redis 双 Key 滑动窗口会话
+│   │   │   ├── manager.py               # MemoryManager 统一编排
+│   │   │   └── store.py                 # JsonMemoryStore (向后兼容)
+│   │   ├── tasks.py                     # 任务状态 CRUD
+│   │   ├── papers/
+│   │   │   ├── search.py               # 论文级检索 + 聚合
+│   │   │   ├── index.py                # ES 论文索引操作
+│   │   │   └── profile.py              # LLM 论文画像抽取
+│   │   └── storage/
+│   │       ├── es.py                    # ES indices + dense_vector store
+│   │       ├── minio.py                 # MinIO 对象存储
+│   │       ├── kafka.py                 # Kafka producer
+│   │       ├── redis.py                 # Redis 上传状态
+│   │       ├── docstore.py             # Elasticsearch docstore
+│   │       └── embedding.py            # DashScope / local embeddings
+│   ├── shared/                          # 纯工具函数 (仅依赖 core)
+│   │   ├── serializers.py              # chunk_to_result, result_to_source
+│   │   ├── dedup.py                     # context/source 去重
+│   │   ├── chunking.py                  # Markdown → Documents
+│   │   ├── token_splitting.py           # Token-level text splitter
+│   │   └── paper_utils.py              # 论文结构抽取
 │   ├── core/                            # config, logging, Pydantic schemas
-│   ├── utils/                           # chunking, token_splitting, paper_structure
 │   └── workers/                         # Kafka consumer, index rebuild CLI
 ├── fronted/                             # Vite + React frontend
 ├── tests/
@@ -163,6 +219,8 @@ flowchart TB
 | `DELETE /api/v1/papers/{task_id}`           | 删除任务及相关存储              |
 | `DELETE /api/v1/papers/batch`               | 批量删除任务                 |
 
+> **多轮对话**：在请求体中传入 `session_id` 即可启用。同一 `session_id` 的多次请求自动串联为多轮对话——Agent 通过 Redis 双 Key 结构恢复完整上下文，支持网络断开重连后继续推理。滑动窗口默认保留最近 20 轮。
+
 ## Agent 工具一览
 
 所有工具由 Agent 根据用户问题自动选择，用户无需手动指定。
@@ -178,15 +236,19 @@ flowchart TB
 | `deep_search_papers`       | 论文检索 + 附带证据依据                   |
 | `get_paper_profile`        | 单篇论文画像（摘要、方法、贡献等）         |
 
-### 任务与记忆（5 个）
+### 任务与记忆（9 个）
 
-| 工具                       | 功能                                     |
-| -------------------------- | ---------------------------------------- |
-| `get_task_status`          | 查询上传/解析/入库状态                    |
-| `remember_fact`            | 存储 session/user/project 三级记忆        |
-| `recall_memory`            | 读取三类记忆                               |
-| `update_workspace_state`   | 更新研究工作流状态                         |
-| `get_workspace_state`      | 读取当前工作流状态                         |
+| 工具                       | 层级         | 功能                                     |
+| -------------------------- | ------------ | ---------------------------------------- |
+| `get_task_status`          | —            | 查询上传/解析/入库状态                    |
+| `remember_fact`            | JsonMemory   | 存储 session/user/project 三级记忆        |
+| `recall_memory`            | JsonMemory   | 读取三类记忆 (字符串匹配)                 |
+| `update_workspace_state`   | JsonMemory   | 更新研究工作流状态                         |
+| `get_workspace_state`      | JsonMemory   | 读取当前工作流状态                         |
+| `search_memories`          | 全部三层      | 语义搜索所有记忆层，返回格式化上下文       |
+| `consolidate_memories`     | Working→Semantic | 高重要性工作记忆固化为长期知识          |
+| `forget_memories`          | 全部三层      | 清理过期/低质量记忆（TTL + 容量淘汰）     |
+| `get_memory_stats`         | 全部三层      | 记忆系统统计信息                          |
 
 ### 写作辅助（4 个，LLM 驱动 + Skill 规则增强）
 
@@ -210,10 +272,10 @@ flowchart TB
 | Profile    | 工具数 | 适用场景                               |
 | ---------- | ------ | -------------------------------------- |
 | `basic`    | 6      | 检索 + 论文搜索 + 任务状态              |
-| `research` | 13     | basic + 四类记忆 + skill 管理           |
+| `research` | 13     | basic + 记忆(4) + skill 管理            |
 | `writing`  | 12     | 检索 + 记忆 + LLM 写作 + skill 管理     |
 | `workflow` | 15     | research + LLM 写作 + skill 管理        |
-| `all`      | 18     | 全部工具（当前默认）                    |
+| `all`      | 22     | 全部工具（含三层记忆检索/整合/遗忘）     |
 
 ## Skill 系统
 
@@ -279,9 +341,9 @@ DASHSCOPE_API_KEY=your_key
 
 ## RAG 索引说明
 
-- **切块（token）**：父块默认 1024 / 重叠 150；子块 256 / 重叠 30（见 `CHILD_*` / `PARENT_*` 环境变量，`app/utils/token_splitting.py`）。
+- **切块（token）**：父块默认 1024 / 重叠 150；子块 256 / 重叠 30（见 `CHILD_*` / `PARENT_*` 环境变量，`app/shared/token_splitting.py`）。
 - **索引**：`papermind_parents`（父块全文 + 顺序元数据）、`papermind_children`（子块 + `dense_vector`）；子块 `metadata.doc_id` 指向父块 `_id`。
-- **顺序字段**：`parent_index`、`child_index`、`prev_parent_id`、`next_parent_id`（入库时由 `chunk_indexing.py` 写入）。
+- **顺序字段**：`parent_index`、`child_index`、`prev_parent_id`、`next_parent_id`（入库时由 `app/services/indexing.py` 写入）。
 - **检索**：子块 BM25 + kNN → RRF 聚合到父块 → `docstore` 取父文；`RETRIEVE_INCLUDE_NEXT_PARENT=true` 时拼接相邻下一块父文。
 - **依赖**：建议安装 `tiktoken`（`requirements.txt`）以保证 token 切分准确。
 
@@ -368,6 +430,20 @@ curl -X POST http://localhost:8000/api/v1/agent/chat \
   -d '{"query":"基于知识库里的论文，帮我写一篇关于水下图像增强方法的综述"}'
 ```
 
+多轮对话（传入 `session_id` 启用会话记忆）：
+
+```bash
+# 第 1 轮
+curl -X POST http://localhost:8000/api/v1/agent/chat \
+  -H "Content-Type: application/json" \
+  -d '{"query":"LCDNet 的方法是什么？","session_id":"my-session"}'
+
+# 第 2 轮 — Agent 自动记住上下文，"它"指 LCDNet
+curl -X POST http://localhost:8000/api/v1/agent/chat \
+  -H "Content-Type: application/json" \
+  -d '{"query":"它的 PSNR 指标是多少？","session_id":"my-session"}'
+```
+
 响应示例：
 
 ```json
@@ -386,9 +462,26 @@ curl -X POST http://localhost:8000/api/v1/agent/chat \
 # Agent / tools / memory 单元测试
 python -m unittest tests.unit.test_agent_first_architecture
 
+# LangGraph + Plan-driven 对比工作流单元测试
+python -m unittest tests.unit.test_langgraph_agent tests.unit.test_comparison_workflow -v
+
+# 三层记忆系统单元测试
+python -m unittest tests.unit.test_memory_system -v
+
+# Redis 会话记忆单元测试 (mock Redis)
+python -m unittest tests.unit.test_session_memory -v
+
 # Python 语法检查
 python -m compileall app tests -q
 ```
+
+### 论文对比（Plan-driven）
+
+对比类问题（如「比较 LCDNet 和 U-shape 的方法」）由 Planner 输出结构化计划：
+
+- `targets`：每篇论文单独 `search_papers_by_query`（不再用整句 query 搜 Top5）
+- `aspects`：方法 / 实验等维度，每篇论文内 `hybrid_retrieve(task_id=paper_id, section_types=...)`
+- LangGraph `Send` 并行执行检索；`coverage_check` 不足时 `query_rewrite` 仅对缺失 `(alias, aspect)` 扩写并重检（保留已有证据，默认最多重试 1 次，见 `COMPARISON_MAX_RETRY`）
 
 ## 当前状态
 
@@ -398,19 +491,21 @@ python -m compileall app tests -q
 - Docling 解析、按章节切分 + token 级 Parent-Child 入库（顺序索引 / 父块链表）
 - Elasticsearch 双索引（`papermind_parents` / `papermind_children`）+ `dense_vector`
 - BM25 + kNN + 应用层 RRF，父块回溯 + 可选 next 父块扩展
-- **LangGraph Agent**（意图路由、任务拆解、分 handler 检索/画像/写作）
+- **LangGraph Agent**（intent_router → memory_recall → planner → plan_validate；对比任务独立 workflow 子图 + Send 并行）
 - 论文画像抽取（LLM + 规则兜底）、索引与论文级检索
-- **Agent-first 统一问答入口**（18 个工具、5 种 profile）
-- session / user / project 三类 JSON 记忆 + workspace 状态
+- **Agent-first 统一问答入口**（22 个工具、5 种 profile）
+- **三层记忆系统**（Working 内存/Semantic ES 向量/Episodic ES 时序）+ **Redis 双 Key 会话记忆**（滑动窗口 20 轮，支持断线重连多轮推理）
 - **LLM 驱动的学术写作工具**（综述大纲、段落生成、学术润色、自我评审）
 - **外部 Skill 包接入系统**（预装 nature-skills + academic-research-skills，共 4 个 Skill）
 
 部分实现 / 进行中：
 
-- `POST /api/v1/agent/chat/stream`：SSE 流式生成答案（图执行非流式）
+- `POST /api/v1/agent/chat/stream`：对比类答案可直接使用 `compare_node` 结果；其余 intent 仍二次流式生成
+- SSE `trace` 事件展示子图执行节点
 - 前端来源侧栏、ChatGPT 式引用展示
 
 暂未实现：
 
 - 选定论文生成综述的端到端固化 workflow
 - 前端对 Agent 路由 / 工具调用 / Skill 加载的完整可视化
+- Semantic / Episodic memory 的 LLM 自动摘要整理

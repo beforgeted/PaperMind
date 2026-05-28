@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from app.services.task_status import get_task
+from app.services.tasks import get_task
 from app.agent.tools.contracts import error_response, json_response
 from app.agent.tools.decorators import tool
-from app.agent.tools.paper_serializers import task_to_result
+from app.shared.serializers import task_to_result
 
 
 @tool

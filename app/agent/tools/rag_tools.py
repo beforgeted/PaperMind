@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from typing import Optional
 
-from app.services.qa_service import answer as qa_answer
-from app.services.retrieval_service import hybrid_retrieve
+from app.services.qa import answer as qa_answer
+from app.services.retrieval import hybrid_retrieve
 from app.agent.tools.contracts import error_response, json_response
 from app.agent.tools.decorators import tool
-from app.agent.tools.paper_serializers import chunk_to_result, result_to_source
+from app.shared.serializers import chunk_to_result, result_to_source
 
 
 @tool

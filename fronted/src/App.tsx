@@ -1,13 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import ReactMarkdown from "react-markdown"
-import remarkGfm from "remark-gfm"
-import { chatWithAgentStream, deletePaper, deletePapers, fetchHealth, fetchTask, listTasks, uploadPaper } from "./api/papers"
-import { SourcesPanel, type SourcesPanelMessage } from "./components/SourcesPanel"
-import type { AgentChatResponse, HealthResponse, TaskRecord } from "./types/api"
+import {
+  chatWithAgentStream,
+  createSession,
+  deletePaper,
+  deletePapers,
+  deleteSession,
+  fetchHealth,
+  fetchSessionHistory,
+  fetchTask,
+  listSessions,
+  listTasks,
+  uploadPaper,
+} from "./api/papers"
+import { ChatPanel } from "./components/ChatPanel"
+import { RecordsPanel } from "./components/RecordsPanel"
+import type { SourcesPanelMessage } from "./components/SourcesPanel"
+import type { AgentChatResponse, HealthResponse, SessionRecord, TaskRecord } from "./types/api"
 import { normalizeCitationList } from "./utils/citations"
+import { historyToChatMessages } from "./utils/sessionHistory"
 import "./App.css"
 
-type PageType = "files" | "chat"
+type PageType = "files" | "chat" | "records"
 
 interface MenuItem {
   id: PageType | "records" | "tags" | "users" | "profile"
@@ -72,7 +85,7 @@ function formatTime(input: string): string {
 
 const menuItems: MenuItem[] = [
   { id: "chat", label: "聊天助手", icon: "C" },
-  { id: "records", label: "聊天记录", icon: "R", disabled: true },
+  { id: "records", label: "聊天记录", icon: "R" },
   { id: "files", label: "知识库", icon: "K" },
   { id: "tags", label: "组织标签", icon: "T", disabled: true },
   { id: "users", label: "用户管理", icon: "U", disabled: true },
@@ -104,6 +117,12 @@ function App() {
   const [sourcesPanelIndex, setSourcesPanelIndex] = useState(0)
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const chatListRef = useRef<HTMLDivElement | null>(null)
+
+  // Session management
+  const [sessions, setSessions] = useState<SessionRecord[]>([])
+  const [currentSessionId, setCurrentSessionId] = useState<string>("")
+  const [sessionsBusy, setSessionsBusy] = useState(false)
+  const [historyLoading, setHistoryLoading] = useState(false)
 
   const topKNum = useMemo(() => {
     if (topK === "") {
@@ -164,7 +183,70 @@ function App() {
   useEffect(() => {
     void loadHealth()
     void loadTasks()
+    void loadSessions()
   }, [loadHealth, loadTasks])
+
+  const loadSessions = useCallback(async () => {
+    setSessionsBusy(true)
+    try {
+      const result = await listSessions()
+      setSessions(result.sessions || [])
+    } catch {
+      // Sessions may not be available yet
+    } finally {
+      setSessionsBusy(false)
+    }
+  }, [])
+
+  const onNewSession = useCallback(async () => {
+    try {
+      const session = await createSession()
+      setSessions((prev) => [session, ...prev])
+      setCurrentSessionId(session.session_id)
+      setChatMessages([])
+    } catch (err) {
+      setBanner(err instanceof Error ? err.message : String(err))
+    }
+  }, [])
+
+  const onSwitchSession = useCallback(async (sessionId: string) => {
+    if (!sessionId) {
+      return
+    }
+    setCurrentSessionId(sessionId)
+    setSourcesPanelMessage(null)
+    setHistoryLoading(true)
+    setChatMessages([])
+    try {
+      const data = await fetchSessionHistory(sessionId)
+      setChatMessages(historyToChatMessages(data.messages))
+      if (data.title) {
+        setSessions((prev) =>
+          prev.map((s) => (s.session_id === sessionId ? { ...s, title: data.title } : s)),
+        )
+      }
+    } catch (error) {
+      setBanner(error instanceof Error ? error.message : String(error))
+      setChatMessages([])
+    } finally {
+      setHistoryLoading(false)
+    }
+  }, [])
+
+  const onDeleteSession = useCallback(async (sessionId: string, event: React.MouseEvent) => {
+    event.stopPropagation()
+    if (!window.confirm("确认删除此会话？")) return
+    try {
+      await deleteSession(sessionId)
+      setSessions((prev) => prev.filter((s) => s.session_id !== sessionId))
+      if (currentSessionId === sessionId) {
+        setCurrentSessionId("")
+        setChatMessages([])
+      }
+    } catch (err) {
+      setBanner(err instanceof Error ? err.message : String(err))
+    }
+  }, [currentSessionId])
 
   useEffect(() => {
     chatListRef.current?.scrollTo({
@@ -323,6 +405,20 @@ function App() {
       setBanner("请输入对话问题。")
       return
     }
+
+    // Auto-create session if not already in one
+    let sid = currentSessionId
+    if (!sid) {
+      try {
+        const session = await createSession()
+        setSessions((prev) => [session, ...prev])
+        sid = session.session_id
+        setCurrentSessionId(sid)
+      } catch (err) {
+        setBanner(err instanceof Error ? err.message : String(err))
+      }
+    }
+
     setAnswerBusy(true)
     setBanner(null)
     const messageId = `${Date.now()}`
@@ -368,15 +464,20 @@ function App() {
 
     try {
       await chatWithAgentStream(
-        { query: question, top_k: topKNum, task_id: scopeTaskId.trim() || undefined },
+        { query: question, top_k: topKNum, task_id: scopeTaskId.trim() || undefined, session_id: sid || undefined },
         (event) => {
           const type = event.type as string
           if (type === "delta" && event.text) {
             appendAnswer(String(event.text))
           } else if (type === "done") {
             finalizeMessage(event)
+          } else if (type === "status" && event.phase === "title" && event.title) {
+            // Auto-generated title from first turn
+            const title = String(event.title)
+            setSessions((prev) =>
+              prev.map((s) => (s.session_id === sid ? { ...s, title } : s)),
+            )
           }
-          // status events (routing, planning) are received but not displayed yet
         },
       )
     } catch (error) {
@@ -399,6 +500,7 @@ function App() {
           <span className="brand__mark" aria-hidden="true">PM</span>
           <span>PaperMind</span>
         </div>
+
         <nav className="menu">
           {menuItems.map((item) => (
             <button
@@ -407,8 +509,9 @@ function App() {
               className={`menu__item ${activePage === item.id ? "is-active" : ""}`}
               disabled={item.disabled}
               onClick={() => {
-                if (item.id === "chat" || item.id === "files") {
+                if (item.id === "chat" || item.id === "files" || item.id === "records") {
                   setActivePage(item.id)
+                  if (item.id === "records") void loadSessions()
                 }
               }}
             >
@@ -439,7 +542,22 @@ function App() {
 
         {banner && <div className="error-box">{banner}</div>}
 
-        {activePage === "files" ? (
+        {activePage === "records" ? (
+          <RecordsPanel
+            sessions={sessions}
+            currentSessionId={currentSessionId}
+            busy={sessionsBusy}
+            onNewSession={() => {
+              void onNewSession()
+              setActivePage("chat")
+            }}
+            onOpenSession={(sessionId) => {
+              void onSwitchSession(sessionId)
+              setActivePage("chat")
+            }}
+            onDeleteSession={(sessionId, e) => void onDeleteSession(sessionId, e)}
+          />
+        ) : activePage === "files" ? (
           <section className="panel">
             <div className="toolbar">
               <button type="button" className="btn btn--primary" disabled={uploadBusy}>
@@ -539,156 +657,38 @@ function App() {
             </div>
           </section>
         ) : (
-          <section className={`chat-page ${sourcesPanelMessage ? "chat-page--with-sources" : ""}`}>
-            <div className="chat-shell">
-              <div className="chat-list" ref={chatListRef}>
-                {chatMessages.length === 0 && (
-                  <div className="chat-empty">
-                    <span className="avatar avatar--assistant" aria-hidden="true">PM</span>
-                    <h2>你好，我是 PaperMind</h2>
-                    <p>你可以直接提问论文内容，我会结合知识库给出回答并附带引用来源。</p>
-                  </div>
-                )}
-                {chatMessages.map((item) => (
-                  <article key={item.id} className="chat-item">
-                    <div className="chat-row chat-row--user">
-                      <div className="chat-message">
-                        <div className="chat-item__head">{formatTime(item.createdAt)}</div>
-                        <div className="chat-bubble chat-bubble--user">{item.question}</div>
-                      </div>
-                      <span className="avatar avatar--user" aria-hidden="true">你</span>
-                    </div>
-                    <div className="chat-row chat-row--assistant">
-                      <span className="avatar avatar--assistant" aria-hidden="true">PM</span>
-                      <div className="chat-message">
-                        <div className="chat-item__head">
-                          <strong>PaperMind</strong>
-                          <span>{formatTime(item.createdAt)}</span>
-                        </div>
-                        <div className={`chat-bubble chat-bubble--assistant answer-content ${item.answer ? "" : "is-streaming"}`}>
-                          {item.answer ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.answer}</ReactMarkdown> : "正在生成回答…"}
-                        </div>
-                        {(item.answer || item.contexts.length > 0 || item.used_tools.length > 0) && (
-                          <div className="message-actions">
-                            <button
-                              type="button"
-                              className={`message-actions__btn message-actions__btn--sources ${
-                                sourcesPanelMessage?.id === item.id ? "is-active" : ""
-                              }`}
-                              onClick={() => {
-                                if (sourcesPanelMessage?.id === item.id) {
-                                  setSourcesPanelMessage(null)
-                                } else {
-                                  openSourcesPanel(item)
-                                }
-                              }}
-                              aria-expanded={sourcesPanelMessage?.id === item.id}
-                              aria-controls="sources-panel"
-                            >
-                              <span className="message-actions__icon" aria-hidden="true">
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                                  <polyline points="14 2 14 8 20 8" />
-                                </svg>
-                              </span>
-                              来源
-                              {item.contexts.length > 0 && (
-                                <span className="message-actions__count">{item.contexts.length}</span>
-                              )}
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  </article>
-                ))}
-              </div>
-
-              <form
-                className="chat-composer"
-                onSubmit={(event) => {
-                  event.preventDefault()
-                  void onSendMessage()
-                }}
-              >
-                <textarea
-                  value={chatInput}
-                  onChange={(event) => setChatInput(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" && !event.shiftKey) {
-                      event.preventDefault()
-                      void onSendMessage()
-                    }
-                  }}
-                  placeholder="给 PaperMind 发送消息"
-                />
-                <div className="composer-footer">
-                  <div className="composer-footer__meta">
-                    <span className="connection-state">
-                      连接
-                      <span className={healthErr ? "connection-state__bad" : "connection-state__ok"}>
-                        {healthErr ? "异常" : health ? "正常" : "…"}
-                      </span>
-                    </span>
-                    <div className="composer-settings" aria-label="检索设置">
-                      <label className="composer-settings__field">
-                        <span className="composer-settings__label">范围</span>
-                        <select
-                          value={scopeTaskId}
-                          onChange={(event) => setScopeTaskId(event.target.value)}
-                          title={selectedScope?.original_filename ?? "全部已完成论文"}
-                        >
-                          <option value="">全部（{searchableTasks.length}）</option>
-                          {searchableTasks.map((task) => (
-                            <option key={task.task_id} value={task.task_id}>
-                              {task.original_filename}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                      <label className="composer-settings__field composer-settings__field--topk">
-                        <span className="composer-settings__label">top_k</span>
-                        <input
-                          type="number"
-                          min={1}
-                          value={topK}
-                          onChange={(event) => {
-                            const value = event.target.value
-                            if (value === "") {
-                              setTopK("")
-                              return
-                            }
-                            setTopK(Math.max(1, Math.floor(Number(value)) || 1))
-                          }}
-                        />
-                      </label>
-                      <button
-                        type="button"
-                        className="composer-settings__refresh"
-                        disabled={!scopeTaskId}
-                        onClick={() => void onRefreshOneTask()}
-                        title="刷新当前论文解析状态"
-                      >
-                        刷新
-                      </button>
-                    </div>
-                  </div>
-                  <div className="composer-actions">
-                    <button type="submit" className="send-button" disabled={answerBusy || !chatInput.trim()}>
-                      {answerBusy ? "..." : "➤"}
-                    </button>
-                  </div>
-                </div>
-              </form>
-            </div>
-
-            <SourcesPanel
-              message={sourcesPanelMessage}
-              selectedIndex={sourcesPanelIndex}
-              onSelectIndex={setSourcesPanelIndex}
-              onClose={() => setSourcesPanelMessage(null)}
-            />
-          </section>
+          <ChatPanel
+            chatMessages={chatMessages}
+            historyLoading={historyLoading}
+            chatInput={chatInput}
+            setChatInput={setChatInput}
+            answerBusy={answerBusy}
+            onSendMessage={() => void onSendMessage()}
+            chatListRef={chatListRef}
+            sourcesPanelMessage={sourcesPanelMessage}
+            sourcesPanelIndex={sourcesPanelIndex}
+            setSourcesPanelIndex={setSourcesPanelIndex}
+            setSourcesPanelMessage={setSourcesPanelMessage}
+            onOpenSources={openSourcesPanel}
+            formatTime={formatTime}
+            sessions={sessions}
+            currentSessionId={currentSessionId}
+            onNewSession={() => void onNewSession()}
+            onSwitchSession={(id) => void onSwitchSession(id)}
+            onOpenRecords={() => {
+              void loadSessions()
+              setActivePage("records")
+            }}
+            scopeTaskId={scopeTaskId}
+            setScopeTaskId={setScopeTaskId}
+            topK={topK}
+            setTopK={setTopK}
+            searchableTasks={searchableTasks}
+            selectedScope={selectedScope}
+            onRefreshOneTask={() => void onRefreshOneTask()}
+            health={health}
+            healthErr={healthErr}
+          />
         )}
       </main>
     </div>

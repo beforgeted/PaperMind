@@ -21,9 +21,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.v1.router import api_v1_router
 from app.core.config import settings
 from app.core.logging import logger, setup_logging
-from app.services.kafka_service import get_kafka_producer
-from app.services.minio_service import get_minio_service
-from app.services.vectorstore_service import ensure_indices as ensure_es_indices
+from app.services.storage.kafka import get_kafka_producer
+from app.services.storage.minio import get_minio_service
+from app.services.storage.es import ensure_indices as ensure_es_indices
 
 
 @asynccontextmanager

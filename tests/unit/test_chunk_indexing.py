@@ -7,12 +7,12 @@ from unittest.mock import patch
 
 from langchain_core.documents import Document
 
-from app.services.chunk_indexing import build_parent_child_batches
+from app.services.indexing import build_parent_child_batches
 
 
 class ChunkIndexingMetadataTests(unittest.TestCase):
-    @patch("app.services.chunk_indexing.parent_text_splitter")
-    @patch("app.services.chunk_indexing.child_text_splitter")
+    @patch("app.services.indexing.parent_text_splitter")
+    @patch("app.services.indexing.child_text_splitter")
     def test_parent_chain_and_child_indices(self, mock_child_splitter, mock_parent_splitter):
         section = Document(
             page_content="Section body for indexing tests.",
@@ -28,7 +28,8 @@ class ChunkIndexingMetadataTests(unittest.TestCase):
         ]
         mock_parent_splitter.return_value.split_documents.return_value = parents
 
-        def split_children(parent_doc):
+        def split_children(docs):
+            parent_doc = docs[0] if isinstance(docs, list) else docs
             return [
                 Document(
                     page_content=f"{parent_doc.page_content}-c0",

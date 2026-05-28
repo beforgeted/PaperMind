@@ -9,9 +9,9 @@ from datetime import datetime
 from fastapi import HTTPException, status
 
 from app.core.schemas import ParseTask, TaskRecord, TaskStatus, UploadResponse
-from app.services.kafka_service import get_kafka_producer
-from app.services.minio_service import get_minio_service
-from app.services.task_status import create_task
+from app.services.storage.kafka import get_kafka_producer
+from app.services.storage.minio import get_minio_service
+from app.services.tasks import create_task
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_MULTIPART_UPLOAD_BYTES = 512 * 1024 * 1024

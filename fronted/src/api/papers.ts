@@ -8,9 +8,41 @@ import type {
   HealthResponse,
   MultipartUploadInitResponse,
   MultipartUploadStatusResponse,
+  SessionHistoryResponse,
+  SessionRecord,
   TaskRecord,
   UploadResponse,
 } from "../types/api"
+
+// ── Session API ───────────────────────────────────────────────────
+
+export function createSession(): Promise<SessionRecord> {
+  return requestJson<SessionRecord>("/api/v1/sessions", { method: "POST" })
+}
+
+export function listSessions(): Promise<{ sessions: SessionRecord[] }> {
+  return requestJson<{ sessions: SessionRecord[] }>("/api/v1/sessions", { method: "GET" })
+}
+
+export function deleteSession(sessionId: string): Promise<unknown> {
+  return requestJson(`/api/v1/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" })
+}
+
+/**
+ * 拉取会话完整对话历史 `GET /api/v1/sessions/{id}/history`
+ */
+export function fetchSessionHistory(
+  sessionId: string,
+  limit = 100,
+): Promise<SessionHistoryResponse> {
+  const params = new URLSearchParams({ limit: String(limit) })
+  return requestJson<SessionHistoryResponse>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/history?${params}`,
+    { method: "GET" },
+  )
+}
+
+// ── Upload / Papers ──────────────────────────────────────────────
 
 const UPLOAD_CHUNK_SIZE = 5 * 1024 * 1024
 const UPLOAD_CONCURRENCY = 3
@@ -188,6 +220,7 @@ export function chatWithAgent(body: AgentChatRequest): Promise<AgentChatResponse
       query: body.query,
       top_k: body.top_k,
       task_id: body.task_id || undefined,
+      session_id: body.session_id || undefined,
     }),
   })
 }
@@ -210,6 +243,7 @@ export async function chatWithAgentStream(
       query: body.query,
       top_k: body.top_k,
       task_id: body.task_id || undefined,
+      session_id: body.session_id || undefined,
     }),
   })
 

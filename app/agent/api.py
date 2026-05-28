@@ -10,7 +10,7 @@ from fastapi.responses import StreamingResponse
 from app.agent.runtime import answer_with_agent, stream_answer_with_agent
 from app.core.logging import logger
 from app.core.schemas import AgentChatRequest, AgentChatResponse, RetrievedChunk
-from app.services.task_status import get_task
+from app.services.tasks import get_task
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 
@@ -76,6 +76,7 @@ async def chat_with_agent(request: AgentChatRequest) -> AgentChatResponse:
             query=query,
             top_k=request.top_k,
             task_id=request.task_id,
+            session_id=request.session_id,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Agent chat failed for query={!r}: {}", query, exc)
@@ -121,6 +122,7 @@ async def chat_with_agent_stream(request: AgentChatRequest):
                 query=query,
                 top_k=request.top_k,
                 task_id=request.task_id,
+                session_id=request.session_id,
             ):
                 yield f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as exc:  # noqa: BLE001

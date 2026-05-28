@@ -7,9 +7,9 @@ from fastapi.concurrency import run_in_threadpool
 
 from app.core.logging import logger
 from app.core.schemas import DeleteTaskResult, DeleteTasksRequest, DeleteTasksResponse, TaskRecord
-from app.services.minio_service import get_minio_service
-from app.services.task_status import delete_task, get_task, list_tasks
-from app.services.vectorstore_service import delete_by_task
+from app.services.storage.minio import get_minio_service
+from app.services.tasks import delete_task, get_task, list_tasks
+from app.services.storage.es import delete_by_task
 
 router = APIRouter()
 

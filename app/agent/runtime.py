@@ -16,40 +16,23 @@ try:
 except Exception:
     pass
 
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-
-from app.agent.graph.graph_builder import get_agent_graph
-from app.agent.graph.state import AgentState
-from app.agent.prompts import build_system_prompt
+from app.agent.builder import get_agent_graph
+from app.agent.state import AgentState
 from app.agent.session import build_user_query, is_task_status_query
 from app.core.logging import logger
-from app.services.llm_service import get_streaming_llm
-
-SYSTEM_PROMPT = build_system_prompt()
-
-_STREAM_QA_PROMPT = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "你是科研论文问答助手。基于下方检索到的论文上下文回答用户问题，"
-            "在引用论据时使用 [parent_id] 标注来源；若上下文不足以回答，请明确说明。"
-            "回答应严谨、忠实于上下文，不要编造未在上下文中出现的事实。"
-            "请使用 Markdown 格式组织回答，合理使用标题、列表、表格等结构，提高可读性。",
-        ),
-        ("human", "上下文：\n{context}\n\n问题：{question}"),
-    ]
-)
 
 
 async def answer_with_agent(
     query: str,
     top_k: int | None = None,
     task_id: str | None = None,
+    session_id: str = "",
 ) -> dict:
     """Answer a PaperMind question with the LangGraph research agent.
 
-    Returns the same dict shape as the old ReAct agent for API compatibility.
+    Args:
+        session_id: Redis session key for multi-turn conversation continuity.
+                    Same session_id across requests restores full history.
     """
     # Pre-check: task status queries without task_id are rejected early
     if is_task_status_query(query) and not task_id:
@@ -68,6 +51,8 @@ async def answer_with_agent(
         "enriched_query": enriched_query,
         "top_k": top_k,
         "task_id": task_id,
+        "session_id": session_id,
+        "messages": [],
     }
 
     try:
@@ -84,19 +69,61 @@ async def answer_with_agent(
             "error": error,
         }
 
+    # Auto-generate title if still default
+    session_title = ""
+    if session_id:
+        try:
+            from app.services.memory.session_store import get_session_store
+            store = get_session_store()
+            current_title = store._redis.hget(store.session_key(session_id), "title") or ""
+            if not current_title or current_title == "新会话":
+                session_title = await _auto_title(session_id, query)
+        except Exception:
+            pass
+
     return {
         "answer": result.get("final_answer", ""),
         "contexts": result.get("final_contexts", []),
         "sources": result.get("final_sources", []),
         "used_tools": result.get("used_tools", []),
         "raw_messages": result.get("raw_messages", []),
+        "session_title": session_title,
     }
+
+
+async def _auto_title(session_id: str, first_query: str) -> str:
+    """Generate a session title from the first user query."""
+    try:
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from app.services.llm import get_llm
+        llm = get_llm()
+        title_raw = llm.invoke([
+            SystemMessage(content="根据用户的第一个问题，生成一个简短的会话标题（不超过20字）。只输出标题，不要引号、解释或标点。"),
+            HumanMessage(content=first_query),
+        ])
+        title = (title_raw.content if hasattr(title_raw, "content") else str(title_raw)).strip()[:50]
+        if title:
+            from app.services.memory.session_store import get_session_store
+            store = get_session_store()
+            store._redis.hset(store.session_key(session_id), "title", title)
+            from app.services.memory.episodic import EpisodicMemory
+            episodic = EpisodicMemory()
+            doc = await episodic.get_session_doc(session_id)
+            if doc:
+                doc["title"] = title
+                await episodic._es.index(index=episodic.config.episodic_es_index, id=session_id, body=doc, refresh=True)
+            logger.info("自动标题: session={} title={}", session_id[:12], title)
+            return title
+    except Exception as exc:
+        logger.warning("自动标题生成失败: {}", exc)
+    return ""
 
 
 async def stream_answer_with_agent(
     query: str,
     top_k: int | None = None,
     task_id: str | None = None,
+    session_id: str = "",
 ) -> AsyncIterator[dict]:
     """Stream an agent answer via SSE-compatible events.
 
@@ -114,7 +141,11 @@ async def stream_answer_with_agent(
         "enriched_query": enriched_query,
         "top_k": top_k,
         "task_id": task_id,
+        "session_id": session_id,
+        "messages": [],
     }
+
+    logger.info("Agent stream start: session_id={} query={:.60}", session_id[:12] if session_id else "(none)", query)
 
     try:
         graph = get_agent_graph()
@@ -123,6 +154,19 @@ async def stream_answer_with_agent(
         error = str(exc)
         yield {"type": "done", "answer": f"Agent 调用失败：{error}", "contexts": [], "sources": [], "used_tools": [], "error": error}
         return
+
+    # Auto-generate title if still default (first turn of new session)
+    if session_id:
+        try:
+            from app.services.memory.session_store import get_session_store
+            store = get_session_store()
+            current_title = store._redis.hget(store.session_key(session_id), "title") or ""
+            if not current_title or current_title == "新会话":
+                title = await _auto_title(session_id, query)
+                if title:
+                    yield {"type": "status", "phase": "title", "title": title, "session_id": session_id}
+        except Exception:
+            pass
 
     # Emit routing + planning metadata
     intent = result.get("intent", "retrieval")
@@ -133,39 +177,115 @@ async def stream_answer_with_agent(
         "intent_confidence": result.get("intent_confidence", 0),
         "routing_reason": result.get("routing_reason", ""),
     }
-    plan = result.get("plan", [])
+    plan = result.get("plan")
     if plan:
         yield {
             "type": "status",
             "phase": "planning",
             "plan_summary": result.get("plan_summary", ""),
-            "plan_steps": [{"step": s.get("step"), "action": s.get("action"), "description": s.get("description")} for s in plan],
+            "plan": _format_plan_for_sse(plan),
+            "plan_steps": _legacy_plan_steps_for_sse(plan),
         }
 
-    # Build context string from retrieved chunks
-    contexts = result.get("final_contexts", [])
-    context_text = _format_contexts_for_stream(contexts)
+    trace = result.get("trace") or []
+    if trace:
+        yield {
+            "type": "status",
+            "phase": "trace",
+            "trace": trace[-20:],
+        }
 
-    # Stream token-by-token
-    chain = _STREAM_QA_PROMPT | get_streaming_llm() | StrOutputParser()
-    accumulated = ""
-    try:
-        async for token in chain.astream({"context": context_text, "question": query}):
-            if token:
-                accumulated += token
-                yield {"type": "delta", "text": token}
-    except Exception as exc:
-        logger.warning("Streaming generation interrupted: {}", exc)
-        if not accumulated:
-            accumulated = result.get("final_answer", "")
+    final_answer = result.get("final_answer", "")
+
+    # chat_handler is now the unified answer generator for ALL intents.
+    # All handlers feed their collected context into chat_handler, which produces
+    # the single final answer. No second LLM call needed — use final_answer directly.
+    accumulated = final_answer
+    if accumulated:
+        yield {"type": "delta", "text": accumulated}
 
     yield {
         "type": "done",
         "answer": accumulated,
-        "contexts": contexts,
+        "contexts": result.get("final_contexts", []),
         "sources": result.get("final_sources", []),
         "used_tools": result.get("used_tools", []),
     }
+
+
+def _format_plan_for_sse(plan: Any) -> dict[str, Any]:
+    """Expose structured plan for comparison or legacy steps."""
+    if isinstance(plan, dict):
+        if plan.get("task_type") == "paper_comparison":
+            return {
+                "task_type": plan.get("task_type"),
+                "targets": plan.get("targets", []),
+                "aspects": [
+                    {"name": a.get("name"), "evidence_query": a.get("evidence_query", "")[:80]}
+                    for a in (plan.get("aspects") or [])
+                    if isinstance(a, dict)
+                ],
+                "output_format": plan.get("output_format", "table"),
+            }
+        return {
+            "task_type": plan.get("task_type"),
+            "steps": plan.get("steps", []),
+        }
+    return {"steps": plan}
+
+
+def _legacy_plan_steps_for_sse(plan: Any) -> list[dict[str, Any]]:
+    """Backward-compatible plan_steps list for clients expecting step objects."""
+    if isinstance(plan, dict):
+        steps = plan.get("steps")
+        if isinstance(steps, list) and steps:
+            return [
+                {
+                    "step": s.get("step"),
+                    "action": s.get("action"),
+                    "description": s.get("description"),
+                }
+                for s in steps
+                if isinstance(s, dict)
+            ]
+        targets = plan.get("targets") or []
+        aspects = plan.get("aspects") or []
+        out: list[dict[str, Any]] = []
+        for i, t in enumerate(targets):
+            if isinstance(t, dict):
+                out.append(
+                    {
+                        "step": i + 1,
+                        "action": "search_papers",
+                        "description": f"Search {t.get('alias')}: {t.get('query')}",
+                    }
+                )
+        base = len(out)
+        for j, a in enumerate(aspects):
+            if isinstance(a, dict):
+                out.append(
+                    {
+                        "step": base + j + 1,
+                        "action": "retrieve_evidence",
+                        "description": f"Retrieve {a.get('name')} evidence",
+                    }
+                )
+        if out:
+            out.append(
+                {"step": len(out) + 1, "action": "compare", "description": "Generate comparison"}
+            )
+        return out
+    if isinstance(plan, list):
+        return [
+            {
+                "step": s.get("step"),
+                "action": s.get("action"),
+                "description": s.get("description"),
+            }
+            for s in plan
+            if isinstance(s, dict)
+        ]
+    return []
 
 
 def _format_contexts_for_stream(contexts: list) -> str:

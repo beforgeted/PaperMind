@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from typing import Optional
 
-from app.services.paper_index_service import get_paper_profile as fetch_paper_profile
-from app.services.paper_search_service import (
+from app.services.papers.index import get_paper_profile as fetch_paper_profile
+from app.services.papers.search import (
     deep_search_papers_by_query,
     search_papers_by_query,
 )
 from app.agent.tools.contracts import error_response, json_response
 from app.agent.tools.decorators import tool
-from app.agent.tools.paper_serializers import (
+from app.shared.serializers import (
     find_profile_by_title,
     paper_search_result_to_result,
     profile_to_result,

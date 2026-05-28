@@ -10,11 +10,11 @@ import asyncio
 
 from app.core.logging import logger, setup_logging
 from app.core.schemas import ParsedDocument, TaskStatus
-from app.services.minio_service import get_minio_service
-from app.services.paper_index_service import upsert_paper_profile
-from app.services.paper_profile_service import extract_paper_profile
-from app.services.task_status import list_tasks
-from app.services.vectorstore_service import ensure_indices
+from app.services.storage.minio import get_minio_service
+from app.services.papers.index import upsert_paper_profile
+from app.services.papers.profile import extract_paper_profile
+from app.services.tasks import list_tasks
+from app.services.storage.es import ensure_indices
 
 
 async def _rebuild_one(task) -> None:

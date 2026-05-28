@@ -137,10 +137,41 @@ class RetrievedChunk(BaseModel):
 
 # ---------- Agent chat ----------
 
+class SessionRecord(BaseModel):
+    session_id: str
+    title: str = "新会话"
+    created_at: str = ""
+    updated_at: str = ""
+    turn_count: int = 0
+    status: str = "active"  # active | archived
+
+
+class SessionListResponse(BaseModel):
+    sessions: List[SessionRecord] = Field(default_factory=list)
+
+
+class SessionHistoryMessage(BaseModel):
+    """One Q&A round restored for the chat UI."""
+
+    id: str
+    question: str
+    answer: str = ""
+    created_at: str = ""
+    used_tools: List[str] = Field(default_factory=list)
+
+
+class SessionHistoryResponse(BaseModel):
+    session_id: str
+    title: str = "新会话"
+    messages: List[SessionHistoryMessage] = Field(default_factory=list)
+    source: str = "none"  # redis | episodic | none
+
+
 class AgentChatRequest(BaseModel):
     query: str = Field(..., min_length=1)
     top_k: Optional[int] = None
     task_id: Optional[str] = None
+    session_id: str = ""  # 会话 ID；传入即启用多轮记忆
 
 
 class AgentChatResponse(BaseModel):

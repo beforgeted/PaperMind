@@ -41,12 +41,12 @@ from aiokafka.errors import KafkaError  # noqa: E402
 from app.core.config import settings  # noqa: E402
 from app.core.logging import logger, setup_logging  # noqa: E402
 from app.core.schemas import ParseTask, TaskStatus  # noqa: E402
-from app.services.docling_service import DoclingParseError, get_docling_service  # noqa: E402
-from app.services.indexing_service import run_indexing  # noqa: E402
-from app.services.paper_index_service import upsert_paper_profile  # noqa: E402
-from app.services.paper_profile_service import extract_paper_profile  # noqa: E402
-from app.services.minio_service import get_minio_service  # noqa: E402
-from app.services.task_status import update_task  # noqa: E402
+from app.services.docling import DoclingParseError, get_docling_service  # noqa: E402
+from app.services.indexing import run_indexing  # noqa: E402
+from app.services.papers.index import upsert_paper_profile  # noqa: E402
+from app.services.papers.profile import extract_paper_profile  # noqa: E402
+from app.services.storage.minio import get_minio_service  # noqa: E402
+from app.services.tasks import update_task  # noqa: E402
 
 
 _shutdown = asyncio.Event()

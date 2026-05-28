@@ -27,8 +27,8 @@ from app.core.schemas import (
     MultipartUploadStatusResponse,
     UploadResponse,
 )
-from app.services.minio_service import get_minio_service
-from app.services.redis_upload_state import UploadStateError, get_upload_state
+from app.services.storage.minio import get_minio_service
+from app.services.storage.redis import UploadStateError, get_upload_state
 
 router = APIRouter()
 
