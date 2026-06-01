@@ -39,8 +39,18 @@ async def chat_handler(state: AgentState) -> dict[str, Any]:
 
     messages: list = [SystemMessage(content=_CHAT_SYSTEM)]
 
-    # 1. Conversation history from Redis (last 10 turns)
-    if session_id:
+    # 1. Conversation history restored by memory_recall_node; fallback to Redis.
+    restored_history = state.get("messages", [])
+    if restored_history:
+        for h in restored_history:
+            role = h.get("role", "")
+            content = h.get("content", "")
+            if role == "user":
+                messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                messages.append(AIMessage(content=content))
+        logger.info("chat_handler: restored history_turns={}", len(restored_history))
+    elif session_id:
         try:
             store = get_session_store()
             history = store.get_history(session_id, max_turns=10, as_messages=True)
@@ -70,12 +80,16 @@ async def chat_handler(state: AgentState) -> dict[str, Any]:
     # 3. Collected evidence from context collectors (retrieval, profile, comparison)
     collected = state.get("handler_contexts", [])
     context_text = _format_collected_contexts(collected)
+    memory_context = state.get("memory_context", "")
 
     # 4. Current query with evidence context
+    prompt_parts: list[str] = []
+    if memory_context:
+        prompt_parts.append(f"记忆上下文：\n{memory_context}")
     if context_text:
-        prompt = f"检索上下文：\n{context_text}\n\n问题：{query}"
-    else:
-        prompt = query
+        prompt_parts.append(f"检索上下文：\n{context_text}")
+    prompt_parts.append(f"问题：{query}" if prompt_parts else query)
+    prompt = "\n\n".join(prompt_parts)
 
     messages.append(HumanMessage(content=prompt))
 

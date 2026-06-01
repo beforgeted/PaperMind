@@ -13,6 +13,7 @@ import {
   uploadPaper,
 } from "./api/papers"
 import { ChatPanel } from "./components/ChatPanel"
+import { KnowledgeBasePanel } from "./components/KnowledgeBasePanel"
 import { RecordsPanel } from "./components/RecordsPanel"
 import type { SourcesPanelMessage } from "./components/SourcesPanel"
 import type { AgentChatResponse, HealthResponse, SessionRecord, TaskRecord } from "./types/api"
@@ -37,39 +38,6 @@ interface ChatMessage {
   contexts: AgentChatResponse["contexts"]
   sources: AgentChatResponse["sources"]
   used_tools: AgentChatResponse["used_tools"]
-}
-
-/**
- * 根据任务状态返回用于样式类名的后缀。
- */
-function statusBadgeClass(status: TaskRecord["status"]): string {
-  switch (status) {
-    case "pending":
-      return "badge--pending"
-    case "parsing":
-    case "indexing":
-      return "badge--parsing"
-    case "succeeded":
-      return "badge--succeeded"
-    case "failed":
-      return "badge--failed"
-    default:
-      return ""
-  }
-}
-
-/**
- * 将任务状态翻译为中文。
- */
-function statusLabel(status: TaskRecord["status"]): string {
-  const map: Record<TaskRecord["status"], string> = {
-    pending: "排队",
-    parsing: "处理中",
-    indexing: "索引中",
-    succeeded: "已完成",
-    failed: "失败",
-  }
-  return map[status] ?? status
 }
 
 /**
@@ -105,7 +73,6 @@ function App() {
   const [tasksBusy, setTasksBusy] = useState(false)
   const [uploadBusy, setUploadBusy] = useState(false)
   const [uploadProgress, setUploadProgress] = useState("")
-  const [fileKeyword, setFileKeyword] = useState("")
   const [selectedTaskIds, setSelectedTaskIds] = useState<string[]>([])
   const [deleteBusy, setDeleteBusy] = useState(false)
 
@@ -132,14 +99,6 @@ function App() {
     return Number.isFinite(n) && n > 0 ? n : undefined
   }, [topK])
 
-  const filteredTasks = useMemo(() => {
-    const keyword = fileKeyword.trim().toLowerCase()
-    if (!keyword) {
-      return tasks
-    }
-    return tasks.filter((row) => row.original_filename.toLowerCase().includes(keyword))
-  }, [tasks, fileKeyword])
-
   const searchableTasks = useMemo(
     () => tasks.filter((row) => row.status === "succeeded"),
     [tasks],
@@ -151,7 +110,6 @@ function App() {
   )
 
   const selectedTaskIdSet = useMemo(() => new Set(selectedTaskIds), [selectedTaskIds])
-  const allVisibleSelected = filteredTasks.length > 0 && filteredTasks.every((task) => selectedTaskIdSet.has(task.task_id))
 
   const loadHealth = useCallback(async () => {
     setHealthErr(null)
@@ -320,13 +278,15 @@ function App() {
   /**
    * 切换当前筛选结果的全选状态。
    */
-  const toggleSelectVisibleTasks = () => {
-    if (allVisibleSelected) {
-      const visible = new Set(filteredTasks.map((task) => task.task_id))
+  const toggleSelectVisibleTasks = (visibleIds: string[]) => {
+    const visible = new Set(visibleIds)
+    const allSelected =
+      visibleIds.length > 0 && visibleIds.every((id) => selectedTaskIdSet.has(id))
+    if (allSelected) {
       setSelectedTaskIds((prev) => prev.filter((id) => !visible.has(id)))
       return
     }
-    setSelectedTaskIds((prev) => Array.from(new Set([...prev, ...filteredTasks.map((task) => task.task_id)])))
+    setSelectedTaskIds((prev) => Array.from(new Set([...prev, ...visibleIds])))
   }
 
   /**
@@ -526,20 +486,6 @@ function App() {
       </aside>
 
       <main className="main">
-        {activePage === "files" && (
-          <header className="topbar topbar--files">
-            <div className="topbar-query topbar-query--files">
-              <input
-                type="text"
-                value={fileKeyword}
-                onChange={(event) => setFileKeyword(event.target.value)}
-                placeholder="检索知识库文件名"
-                autoComplete="off"
-              />
-            </div>
-          </header>
-        )}
-
         {banner && <div className="error-box">{banner}</div>}
 
         {activePage === "records" ? (
@@ -558,104 +504,25 @@ function App() {
             onDeleteSession={(sessionId, e) => void onDeleteSession(sessionId, e)}
           />
         ) : activePage === "files" ? (
-          <section className="panel">
-            <div className="toolbar">
-              <button type="button" className="btn btn--primary" disabled={uploadBusy}>
-                <label className="upload-label">
-                  {uploadBusy ? uploadProgress || "上传中..." : "新增"}
-                  <input type="file" accept=".pdf,application/pdf" disabled={uploadBusy} onChange={(event) => void onPickFile(event)} />
-                </label>
-              </button>
-              <button type="button" className="btn" disabled={tasksBusy} onClick={() => void loadTasks()}>
-                {tasksBusy ? "刷新中..." : "刷新"}
-              </button>
-              <button type="button" className="btn btn--danger-solid" disabled={deleteBusy || selectedTaskIds.length === 0} onClick={() => void onDeleteSelected()}>
-                {deleteBusy ? "删除中..." : `批量删除${selectedTaskIds.length ? ` (${selectedTaskIds.length})` : ""}`}
-              </button>
-            </div>
-
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>
-                      <input
-                        type="checkbox"
-                        checked={allVisibleSelected}
-                        disabled={filteredTasks.length === 0}
-                        onChange={toggleSelectVisibleTasks}
-                        aria-label="选择当前列表全部文件"
-                      />
-                    </th>
-                    <th className="col-filename">文件名</th>
-                    <th>上传状态</th>
-                    <th>任务标签</th>
-                    <th>是否公开</th>
-                    <th>上传时间</th>
-                    <th>操作</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredTasks.length === 0 && (
-                    <tr>
-                      <td colSpan={7} className="muted">
-                        暂无文件
-                      </td>
-                    </tr>
-                  )}
-                  {filteredTasks.map((task) => (
-                    <tr key={task.task_id}>
-                      <td>
-                        <input
-                          type="checkbox"
-                          checked={selectedTaskIdSet.has(task.task_id)}
-                          onChange={() => toggleTaskSelection(task.task_id)}
-                          aria-label={`选择 ${task.original_filename}`}
-                        />
-                      </td>
-                      <td className="col-filename">
-                        <span className="filename-ellipsis" data-full-name={task.original_filename} title={task.original_filename}>
-                          {task.original_filename}
-                        </span>
-                      </td>
-                      <td>
-                        <span className={`badge ${statusBadgeClass(task.status)}`}>{statusLabel(task.status)}</span>
-                      </td>
-                      <td>{task.task_id.slice(0, 8)}</td>
-                      <td>
-                        <span className="chip">私有</span>
-                      </td>
-                      <td>{formatTime(task.created_at)}</td>
-                      <td>
-                        <div className="table-actions">
-                          <button
-                            type="button"
-                            className="btn btn--primary"
-                            disabled={task.status !== "succeeded"}
-                            onClick={() => {
-                              setScopeTaskId(task.task_id)
-                              setActivePage("chat")
-                              setBanner(`已将检索范围切换为：${task.original_filename}`)
-                            }}
-                          >
-                            {task.status === "succeeded" ? "用于检索" : "不可检索"}
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn--danger-solid"
-                            disabled={deleteBusy}
-                            onClick={() => void onDeleteOne(task)}
-                          >
-                            删除
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </section>
+          <KnowledgeBasePanel
+            tasks={tasks}
+            busy={tasksBusy}
+            uploadBusy={uploadBusy}
+            uploadProgress={uploadProgress}
+            deleteBusy={deleteBusy}
+            selectedTaskIds={selectedTaskIds}
+            onToggleTask={toggleTaskSelection}
+            onToggleSelectVisible={toggleSelectVisibleTasks}
+            onUpload={(event) => void onPickFile(event)}
+            onRefresh={() => void loadTasks()}
+            onDeleteSelected={() => void onDeleteSelected()}
+            onDeleteOne={(task) => void onDeleteOne(task)}
+            onUseForSearch={(task) => {
+              setScopeTaskId(task.task_id)
+              setActivePage("chat")
+              setBanner(`已将检索范围切换为：${task.original_filename}`)
+            }}
+          />
         ) : (
           <ChatPanel
             chatMessages={chatMessages}

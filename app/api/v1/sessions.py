@@ -48,11 +48,11 @@ def _turns_from_redis(session_id: str, *, max_turns: int) -> list[dict]:
     return turns
 
 
-async def _load_session_turns(session_id: str, *, max_turns: int) -> tuple[list[dict], str]:
+def _load_session_turns(session_id: str, *, max_turns: int) -> tuple[list[dict], str]:
     """Load turns: prefer ES episodic (full archive), else Redis (recent window)."""
     try:
         episodic = _get_episodic()
-        doc = await episodic.get_session_doc(session_id)
+        doc = episodic.get_session_doc(session_id)
         if doc:
             es_turns = doc.get("turns") or []
             if isinstance(es_turns, list) and es_turns:
@@ -122,7 +122,7 @@ async def create_session() -> SessionRecord:
     # Also init ES episodic doc
     try:
         episodic = _get_episodic()
-        await episodic.create_session_doc(sid, "新会话", now)
+        episodic.create_session_doc(sid, "新会话", now)
     except Exception as exc:
         logger.warning("Episodic session doc init failed (non-fatal): {}", exc)
 
@@ -137,7 +137,7 @@ async def list_sessions() -> SessionListResponse:
     # 1. Try ES episodic (permanent archive)
     try:
         episodic = _get_episodic()
-        es_sessions = await episodic.list_sessions(limit=50)
+        es_sessions = episodic.list_sessions(limit=50)
         for s in es_sessions:
             sessions.append(SessionRecord(
                 session_id=s.get("session_id", ""),
@@ -188,7 +188,7 @@ async def get_session_history(session_id: str, limit: int = 100) -> SessionHisto
 
     es_doc: dict | None = None
     try:
-        es_doc = await _get_episodic().get_session_doc(session_id)
+        es_doc = _get_episodic().get_session_doc(session_id)
         if es_doc:
             found = True
             title = es_doc.get("title") or title
@@ -198,7 +198,7 @@ async def get_session_history(session_id: str, limit: int = 100) -> SessionHisto
     if not found:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Session {session_id} not found")
 
-    turns, source = await _load_session_turns(session_id, max_turns=limit)
+    turns, source = _load_session_turns(session_id, max_turns=limit)
     return SessionHistoryResponse(
         session_id=session_id,
         title=title,
@@ -215,7 +215,7 @@ async def get_session(session_id: str) -> SessionRecord:
     if not data:
         try:
             episodic = _get_episodic()
-            doc = await episodic.get_session_doc(session_id)
+            doc = episodic.get_session_doc(session_id)
             if doc:
                 return SessionRecord(
                     session_id=doc.get("session_id", session_id),
@@ -252,10 +252,10 @@ async def update_session(session_id: str, title: str | None = None) -> SessionRe
         # Also update ES
         try:
             episodic = _get_episodic()
-            es = await episodic.get_session_doc(session_id)
+            es = episodic.get_session_doc(session_id)
             if es:
                 es["title"] = title
-                await episodic._es.index(
+                episodic._es.index(
                     index=episodic.config.episodic_es_index,
                     id=session_id,
                     body=es,
@@ -283,7 +283,7 @@ async def delete_session(session_id: str) -> dict[str, str]:
 
     try:
         episodic = _get_episodic()
-        await episodic.delete_session(session_id)
+        episodic.delete_session(session_id)
     except Exception as exc:
         logger.warning("ES session delete failed (non-fatal): {}", exc)
 

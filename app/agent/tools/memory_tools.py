@@ -12,17 +12,12 @@ from typing import Any
 from app.agent.tools.contracts import error_response, json_response
 from app.agent.tools.decorators import tool
 from app.services.memory import get_memory_store
-from app.services.memory.manager import MemoryManager
-
-_memory_manager: MemoryManager | None = None
+from app.services.memory.manager import get_memory_manager
 
 
-def _get_manager() -> MemoryManager:
-    """Lazy singleton for the three-layer memory manager."""
-    global _memory_manager
-    if _memory_manager is None:
-        _memory_manager = MemoryManager()
-    return _memory_manager
+def _get_manager():
+    """Lazy singleton for the memory manager."""
+    return get_memory_manager()
 
 
 def _parse_value(value: str) -> Any:
@@ -80,17 +75,17 @@ def get_workspace_state() -> str:
         return error_response(tool_name, "workspace", exc)
 
 
-# ── New three-layer memory tools ────────────────────────────────────────
+# ── Long-term semantic memory tools ─────────────────────────────────────
 
 @tool
 def search_memories(query: str, scope: str = "user", include_semantic: bool = True, include_episodic: bool = True) -> str:
-    """Semantic search across all memory layers. Use to find past preferences, research context, or interaction history related to a topic."""
+    """Search distilled long-term memories and, optionally, archived session turns."""
     tool_name = "search_memories"
     try:
         result = asyncio.run(_get_manager().recall(
             query=query,
             scope=scope,  # type: ignore[arg-type]
-            include_working=True,
+            include_working=False,
             include_semantic=include_semantic,
             include_episodic=include_episodic,
         ))
@@ -108,7 +103,7 @@ def search_memories(query: str, scope: str = "user", include_semantic: bool = Tr
 
 @tool
 def consolidate_memories() -> str:
-    """Move high-importance working memories to long-term semantic storage. Call periodically or after important interactions."""
+    """Extract long-term semantic memories from pending ES episodic session archives."""
     tool_name = "consolidate_memories"
     try:
         count = asyncio.run(_get_manager().consolidate())
@@ -124,10 +119,10 @@ def consolidate_memories() -> str:
 
 @tool
 def forget_memories() -> str:
-    """Clean up expired or stale memories across all layers."""
+    """Clean up stale semantic memories and old episodic session archives."""
     tool_name = "forget_memories"
     try:
-        result = asyncio.run(_get_manager().forget_expired())
+        result = _get_manager().forget_expired()
         return json_response(
             tool_name=tool_name,
             query="forget",

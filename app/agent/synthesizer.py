@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -81,8 +82,8 @@ async def synthesizer_node(state: AgentState) -> dict[str, Any]:
 
         # 2. ES Episodic permanent storage (full original text)
         try:
-            from app.services.memory.episodic import EpisodicMemory
-            episodic = EpisodicMemory()
+            from app.services.memory.manager import get_memory_manager
+            manager = get_memory_manager()
 
             user_turn = {
                 "turn_id": user_turn_id,
@@ -92,7 +93,7 @@ async def synthesizer_node(state: AgentState) -> dict[str, Any]:
                 "used_tools": [],
                 "timestamp": now,
             }
-            turn_count = await episodic.append_turn(session_id, user_turn)
+            await asyncio.to_thread(manager.episodic.append_turn, session_id, user_turn)
 
             assistant_turn = {
                 "turn_id": assistant_turn_id,
@@ -102,7 +103,7 @@ async def synthesizer_node(state: AgentState) -> dict[str, Any]:
                 "used_tools": list(used_tools),
                 "timestamp": now,
             }
-            await episodic.append_turn(session_id, assistant_turn)
+            await asyncio.to_thread(manager.episodic.append_turn, session_id, assistant_turn)
         except Exception:
             logger.debug("ES episodic turn append skipped (non-fatal)")
 

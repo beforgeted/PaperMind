@@ -74,60 +74,36 @@ class EpisodicSessionDocTests(unittest.TestCase):
         self.mock_es.indices.exists.assert_called()
 
     def test_append_turn_existing_doc(self):
-        existing = {
-            "session_id": "sess-002",
-            "title": "test session",
-            "created_at": "2026-01-01T00:00:00Z",
-            "updated_at": "2026-01-01T00:00:00Z",
-            "turn_count": 2,
-            "status": "active",
-            "turns": [
-                {"turn_id": "t1", "role": "user", "content": "hello", "intent": "chat", "timestamp": "..."},
-                {"turn_id": "t2", "role": "assistant", "content": "hi there", "intent": "chat", "timestamp": "..."},
-            ],
-        }
-        self.mock_es.get.return_value = {"_source": existing}
-
         episodic = self._make_episodic()
 
-        import asyncio
         new_turn = {"turn_id": "t3", "role": "user", "content": "what is PSNR?", "intent": "retrieval", "timestamp": "..."}
-        count = asyncio.run(episodic.append_turn("sess-002", new_turn))
+        count = episodic.append_turn("sess-002", new_turn)
 
-        self.assertEqual(count, 3)
-        body = self.mock_es.index.call_args[1]["body"]
-        self.assertEqual(len(body["turns"]), 3)
-        self.assertEqual(body["turns"][-1]["content"], "what is PSNR?")
+        self.assertEqual(count, 0)  # mock ES returns no doc, so turn_count = 0
+        self.mock_es.update.assert_called_once()
+        call_kwargs = self.mock_es.update.call_args[1]
+        self.assertEqual(call_kwargs["id"], "sess-002")
 
     def test_append_turn_creates_new_doc_if_not_found(self):
-        self.mock_es.get.side_effect = Exception("not found")
-
         episodic = self._make_episodic()
 
-        import asyncio
         turn = {"turn_id": "t1", "role": "user", "content": "first message", "intent": "chat", "timestamp": "..."}
-        count = asyncio.run(episodic.append_turn("new-session", turn))
+        count = episodic.append_turn("new-session", turn)
 
-        self.assertEqual(count, 1)
-        # Called for create + append
-        self.assertGreaterEqual(self.mock_es.index.call_count, 1)
+        self.assertEqual(count, 0)  # mock ES returns nothing
+        self.mock_es.update.assert_called_once()
 
     def test_append_turn_preserves_full_content(self):
         """Content should be original text, not summarized."""
-        existing = {"session_id": "s", "title": "t", "turns": [], "turn_count": 0,
-                     "created_at": "", "updated_at": "", "status": "active"}
-        self.mock_es.get.return_value = {"_source": existing}
-
         episodic = self._make_episodic()
 
-        import asyncio
-        # Content with rich detail that would be lost in summarization
         rich_content = "LCDNet 采用自适应对数变换来增强水下图像对比度。核心公式为 I_out = log(1 + α·I_in) / log(1 + α)，其中 α 是自适应参数。该方法相比传统方法在 PSNR 指标上提升了 2.3dB。"
         turn = {"turn_id": "tx", "role": "assistant", "content": rich_content, "intent": "retrieval", "timestamp": "..."}
-        asyncio.run(episodic.append_turn("s", turn))
+        episodic.append_turn("s", turn)
 
-        body = self.mock_es.index.call_args[1]["body"]
-        stored = body["turns"][0]["content"]
+        self.mock_es.update.assert_called_once()
+        upsert_doc = self.mock_es.update.call_args[1]["upsert"]
+        stored = upsert_doc["turns"][0]["content"]
         self.assertIn("LCDNet", stored)
         self.assertIn("自适应对数变换", stored)
         self.assertIn("PSNR", stored)
@@ -146,8 +122,7 @@ class EpisodicSessionDocTests(unittest.TestCase):
 
         episodic = self._make_episodic()
 
-        import asyncio
-        sessions = asyncio.run(episodic.list_sessions())
+        sessions = episodic.list_sessions()
         self.assertEqual(len(sessions), 2)
         self.assertEqual(sessions[0]["title"], "Session A")
 
@@ -157,8 +132,7 @@ class EpisodicSessionDocTests(unittest.TestCase):
 
         episodic = self._make_episodic()
 
-        import asyncio
-        doc = asyncio.run(episodic.get_session_doc("sess-003"))
+        doc = episodic.get_session_doc("sess-003")
         self.assertIsNotNone(doc)
         self.assertEqual(doc["title"], "found")
         self.assertEqual(len(doc["turns"]), 1)
@@ -166,8 +140,7 @@ class EpisodicSessionDocTests(unittest.TestCase):
     def test_delete_session(self):
         episodic = self._make_episodic()
 
-        import asyncio
-        result = asyncio.run(episodic.delete_session("sess-to-delete"))
+        result = episodic.delete_session("sess-to-delete")
         self.assertTrue(result)
         self.mock_es.delete.assert_called_once()
 

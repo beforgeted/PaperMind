@@ -1,7 +1,8 @@
 """Memory data models for PaperMind agent memory system.
 
-Inspired by Hello Agents Ch.8 — three-layer memory:
-  Working (short-term) → Semantic (knowledge) → Episodic (history)
+The current architecture keeps short-term conversation state in Redis,
+archives raw sessions in ES Episodic, and stores distilled long-term facts in
+Semantic memory.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from pydantic import BaseModel, Field
 
 
 MemoryScope = Literal["session", "user", "project"]
+MemoryKind = Literal["preference", "research_interest", "project_state", "writing_style", "fact"]
 
 
 class MemoryType(str, Enum):
@@ -34,6 +36,14 @@ class MemoryItem(BaseModel):
     key: str = ""               # Short label (e.g. "preferred_language", "query:2026-05-28")
     content: str = ""           # Free-text body
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    # Long-term semantic memory dimensions
+    user_id: str = ""
+    project_id: str = ""
+    memory_kind: MemoryKind = "fact"
+    source_session_ids: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    last_evidence_at: str = ""
 
     # Scoring
     importance: float = Field(default=0.5, ge=0.0, le=1.0)
