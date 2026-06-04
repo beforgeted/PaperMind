@@ -1,0 +1,29 @@
+# Secrets & local config
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Node / frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Data & logs
+volumes/
+logs/
+uploads/
+
+# IDE & tooling
+.claude/
+.idea/
+.vscode/
+*.swp
+.DS_Store
