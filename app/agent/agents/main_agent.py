@@ -7,9 +7,8 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
-from langchain_core.messages import HumanMessage, SystemMessage
-
 from app.agent.agents.agent_registry import CANONICAL_AGENT_ORDER
+from app.agent.graphs.graph_state import PaperMindState
 
 
 logger = logging.getLogger(__name__)
@@ -36,6 +35,12 @@ MAIN_AGENT_ROUTING_PROMPT = """你是 PaperMind 学术研究多 Agent 系统的�
 - 写作类需求可独立执行，也可在检索后再润色（先 retrieval-agent 后 writing-agent）
 - profile-agent 可独立执行
 
+## 上下文理解要求
+- 若用户问题依赖对话历史（指代、省略、续问），必须输出 standalone_query（消解指代后的独立完整问题）
+- 在 resolved_entities 中列出指代消解映射，如 {"它": "LCDNet"}
+- 通过 context_requirements 为各子 Agent 建议上下文策略（实际裁剪由系统执行，你只需输出建议）
+- context_requirements 可选字段：history_turns, include_upstream, use_standalone_query, include_evidence_packets
+
 ## 输出格式
 
 只输出一行合法 JSON，不要使用 Markdown 代码块，不要输出额外解释。
@@ -46,6 +51,15 @@ MAIN_AGENT_ROUTING_PROMPT = """你是 PaperMind 学术研究多 Agent 系统的�
   "reason": "调度原因；direct_answer 时写直接回复用户的内容",
   "query_for_agent": "默认子任务描述",
   "queries_per_agent": {"retrieval-agent": "针对该 Agent 的具体子任务"},
+  "standalone_query": "消解指代后的独立问题",
+  "resolved_entities": {"它": "LCDNet"},
+  "context_requirements": {
+    "retrieval-agent": {
+      "history_turns": 0,
+      "include_upstream": false,
+      "use_standalone_query": true
+    }
+  },
   "route_plan": [
     {
       "step": 1,
@@ -59,7 +73,7 @@ MAIN_AGENT_ROUTING_PROMPT = """你是 PaperMind 学术研究多 Agent 系统的�
 
 ## 关键约束
 - target_agents 必须是上文列表中的真实 agent_id。
-- action=dispatch 时 target_agents 非空，且必须填写 queries_per_agent（每个 id 一条）。
+- action=dispatch 时 target_agents 非空，且必须填写 queries_per_agent（每个 id 一条）和 standalone_query。
 - action=direct_answer 时 target_agents 为空数组。
 - route_plan 中 agent_id 须与 target_agents 一致。
 - 禁止编造不存在的 Agent、论文或工具结果。
@@ -89,8 +103,15 @@ class MainAgent:
             self.build_agents_description(agents),
         )
 
-    async def recognize_intent(self, *, query: str, agents: List[Dict[str, Any]]) -> Dict[str, Any]:
+    async def recognize_intent(
+        self,
+        *,
+        state: PaperMindState,
+        agents: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
         from app.services.llm_service import llm_service, message_content_to_text
+
+        query = str(state.get("query") or "")
 
         try:
             llm = llm_service.create_chat_model(
@@ -104,10 +125,9 @@ class MainAgent:
         except ValueError as exc:
             return self.empty_decision(reason=str(exc))
 
-        messages = [
-            SystemMessage(content=self.build_prompt(agents)),
-            HumanMessage(content=query),
-        ]
+        from app.agent.context import context_builder
+
+        messages = context_builder.build_for_router(state, agents=agents)
         response = await llm.ainvoke(messages)
         raw = message_content_to_text(getattr(response, "content", ""))
         return self.generate_plan(raw=raw, agents=agents, query=query)
@@ -122,6 +142,26 @@ class MainAgent:
             agent_id: str(queries_per_agent.get(agent_id) or default_query)
             for agent_id in target_agents
         }
+
+    def _normalize_context_requirements(
+        self,
+        raw: Any,
+        valid_ids: set[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return {}
+        normalized: Dict[str, Dict[str, Any]] = {}
+        for agent_id, policy in raw.items():
+            key = str(agent_id)
+            if key not in valid_ids or not isinstance(policy, dict):
+                continue
+            normalized[key] = dict(policy)
+        return normalized
+
+    def _normalize_resolved_entities(self, raw: Any) -> Dict[str, str]:
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k): str(v) for k, v in raw.items() if str(v).strip()}
 
     def generate_plan(self, *, raw: str, agents: List[Dict[str, Any]], query: str) -> Dict[str, Any]:
         decision = self.parse_json_decision(raw)
@@ -142,11 +182,23 @@ class MainAgent:
         if not isinstance(route_plan, list):
             route_plan = []
 
+        standalone_query = str(decision.get("standalone_query") or query).strip() or query
+        resolved_entities = self._normalize_resolved_entities(
+            decision.get("resolved_entities"),
+        )
+        context_requirements = self._normalize_context_requirements(
+            decision.get("context_requirements"),
+            valid_ids,
+        )
+
         common = {
             "needs_clarification": False,
-            "detected_entities": {},
+            "detected_entities": resolved_entities,
             "route_plan": route_plan,
             "prompt_guardrails": [],
+            "standalone_query": standalone_query,
+            "resolved_entities": resolved_entities,
+            "context_requirements": context_requirements,
         }
 
         if action == "dispatch" and target_agents:
@@ -178,6 +230,9 @@ class MainAgent:
             "query_for_agent": "",
             "queries_per_agent": {},
             "detected_entities": {},
+            "resolved_entities": {},
+            "context_requirements": {},
+            "standalone_query": "",
             "route_plan": [],
             "prompt_guardrails": [],
         }

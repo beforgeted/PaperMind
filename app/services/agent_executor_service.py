@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Optional
+import time
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from app.core.log_context import log_bind
+from app.observability.events import (
+    AGENT_EXECUTION_COMPLETED,
+    AGENT_EXECUTION_STARTED,
+    TOOL_CALL_COMPLETED,
+)
+
+from langchain_core.messages import AIMessage, ToolMessage
 
 from app.agent.agents.main_agent import main_agent
+from app.agent.context import context_builder, extract_evidence_packet
+from app.agent.graphs.graph_state import PaperMindState
 from app.agent.tools.registry import get_tools_for_agent
 from app.services.mcp_server_service import TOOLS_WITH_TASK_ID, TOOLS_WITH_TOP_K
 from app.services.llm_service import llm_service, message_content_to_text
@@ -15,32 +25,6 @@ from app.services.orchestrator_service import orchestrator
 
 
 logger = logging.getLogger(__name__)
-
-SUB_AGENT_DEFAULT_PROMPT = """你是"{agent_name}"。
-
-职责范围：
-{agent_description}
-
-## 工具使用规则
-
-你有可用的检索工具。对于需要事实性信息的问题，你必须调用工具获取真实数据，
-不得编造或猜测论文内容、作者、发表年份等具体信息。
-如果工具返回了结果，请基于工具返回的真实数据回答用户。
-如果工具调用失败或未找到数据，如实说明，不要编造。
-
-请只处理主 Agent 分配给你的任务。回答要清晰、直接。
-"""
-
-TOOL_SYSTEM_PROMPT_SUFFIX = """
-## 关键规则
-
-1. **必须使用工具**: 当问题涉及论文检索、文献证据、论文信息时，必须调用对应工具获取真实数据
-2. **禁止编造**: 不得伪造论文标题、作者、年份、PMID、DOI 或任何研究结果
-3. **引用来源**: 基于工具返回的真实数据回答，标注来源
-4. **工具失败时如实说明**: 如果工具返回空结果或失败，直接告知用户，不要编造
-5. **格式化输出**: 使用 Markdown 组织回答
-6. **直接给答案**: 不要输出你的思考过程、分析步骤或"本阶段任务""职责履行完毕"等元描述。只输出用户需要的最终答案
-"""
 
 MAX_TOOL_ROUNDS = 5
 
@@ -52,62 +36,22 @@ class AgentExecutorService:
         content = str(result.get("content") or "")
         return main_agent.parse_json_decision(content)
 
-    def sub_agent_prompt(
-        self, agent: Dict[str, Any], context: Optional[Dict[str, Any]] = None
-    ) -> str:
-        prompt_config = agent.get("promptConfig") or {}
-        prompt = prompt_config.get("prompt") if isinstance(prompt_config, dict) else ""
-        if prompt:
-            base_prompt = str(prompt)
-        else:
-            base_prompt = SUB_AGENT_DEFAULT_PROMPT.format(
-                agent_name=agent.get("name", "子 Agent"),
-                agent_description=agent.get("description", "未配置职责描述"),
-            )
-        base_prompt += TOOL_SYSTEM_PROMPT_SUFFIX
-
-        # Issue #7: inject task_id / top_k from request context so the LLM
-        # passes them to retrieval tools (retrieve_evidence, search_papers, etc.)
-        ctx = context or {}
-        task_id = ctx.get("task_id") or ""
-        top_k = ctx.get("top_k")
-        if task_id or top_k is not None:
-            hints = []
-            if task_id:
-                hints.append(f"- 当前任务上下文 task_id = \"{task_id}\"，调用检索工具时请传入此 task_id")
-            if top_k is not None:
-                hints.append(f"- 检索数量 top_k = {top_k}，调用检索工具时请传入此值")
-            if hints:
-                base_prompt += (
-                    "\n\n## 当前检索参数\n"
-                    + "\n".join(hints)
-                    + "\n调用任意检索工具时，必须使用上述参数值。"
-                )
-        return base_prompt
-
     async def _execute_tool_calls(
         self,
         response: AIMessage,
         messages: list,
         tools: list,
         agent_id: str,
-        context: Optional[Dict[str, Any]] = None,
+        state: PaperMindState,
+        evidence_packets: List[Dict[str, Any]],
     ) -> None:
         """Execute all tool calls from a single AI response and append ToolMessages."""
         messages.append(response)
+        ctx = state.get("context") or {}
         for tool_call in response.tool_calls:
             tool_name = tool_call.get("name", "")
             tool_args = tool_call.get("args", {})
             tool_call_id = tool_call.get("id", "")
-            logger.info(
-                "Agent %s calling tool: %s(%s)",
-                agent_id,
-                tool_name,
-                str(tool_args)[:100],
-            )
-
-            # Inject default task_id/top_k from context if not provided by model
-            ctx = context or {}
             if tool_name in TOOLS_WITH_TASK_ID:
                 if "task_id" not in tool_args or not tool_args.get("task_id"):
                     default_task_id = ctx.get("task_id") or ""
@@ -122,6 +66,7 @@ class AgentExecutorService:
                         tool_args["top_k"] = int(default_top_k)
 
             tool_result = "工具未找到"
+            tool_start = time.perf_counter()
             for tool in tools:
                 if tool.name == tool_name:
                     try:
@@ -130,6 +75,26 @@ class AgentExecutorService:
                     except Exception as exc:
                         tool_result = f"工具调用失败: {str(exc)}"
                     break
+
+            logger.info(
+                "tool_call_completed",
+                extra={
+                    "event": TOOL_CALL_COMPLETED,
+                    "tool_name": tool_name,
+                    "args_preview": str(tool_args)[:200],
+                    "result_len": len(tool_result),
+                    "latency_ms": round((time.perf_counter() - tool_start) * 1000),
+                    "success": "工具调用失败" not in tool_result and tool_result != "工具未找到",
+                },
+            )
+
+            packet = extract_evidence_packet(
+                tool_name=tool_name,
+                content=tool_result,
+                agent_id=agent_id,
+            )
+            if packet:
+                evidence_packets.append(packet)
 
             messages.append(
                 ToolMessage(
@@ -142,17 +107,19 @@ class AgentExecutorService:
         self,
         *,
         agent: Dict[str, Any],
-        task_query: str,
+        state: PaperMindState,
         tools: Optional[list] = None,
-        context: Optional[Dict[str, Any]] = None,
+        evidence_packets: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncGenerator[str, None]:
-        """执行子 Agent，支持可选的 tool-calling 循环。
-
-        当 tools 非空且 agent 需要事实性信息时，先通过非流式调用完成
-        tool-calling 循环，然后流式输出最终回答。
-        无 tools 时直接流式调用 LLM。
-        """
+        """执行子 Agent，支持可选的 tool-calling 循环。"""
         agent_id = str(agent.get("agent_id") or "")
+        exec_start = time.perf_counter()
+        tool_rounds = 0
+        with log_bind(agent_id=agent_id):
+            logger.info(
+                "Agent execution started",
+                extra={"event": AGENT_EXECUTION_STARTED, "has_tools": bool(tools)},
+            )
         llm = llm_service.create_chat_model(
             llm_service.merge_sub_agent_model_config(agent.get("modelConfig")),
             streaming=True,
@@ -160,14 +127,14 @@ class AgentExecutorService:
             max_tokens=4096,
         )
 
-        system_prompt = self.sub_agent_prompt(agent, context=context)
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=task_query),
-        ]
+        messages = context_builder.build_for_sub_agent(
+            state,
+            agent_id=agent_id,
+            agent=agent,
+        )
+        collected_evidence = evidence_packets if evidence_packets is not None else []
 
         if tools:
-            # Tool-calling non-streaming loop
             llm_with_tools = llm.bind_tools(tools)
             response = await llm_with_tools.ainvoke(messages)
             rounds = 0
@@ -177,13 +144,18 @@ class AgentExecutorService:
                 and rounds < MAX_TOOL_ROUNDS
             ):
                 rounds += 1
-                await self._execute_tool_calls(response, messages, tools, agent_id, context=context)
+                tool_rounds = rounds
+                await self._execute_tool_calls(
+                    response,
+                    messages,
+                    tools,
+                    agent_id,
+                    state,
+                    collected_evidence,
+                )
                 response = await llm_with_tools.ainvoke(messages)
 
-            # Issue #11: stream final answer WITHOUT bind_tools to prevent
-            # the model from triggering additional tool_calls during streaming.
             if hasattr(response, "content") and response.content:
-                # Append final response so the stream context is complete
                 messages.append(response)
                 final_llm_no_tools = llm_service.create_chat_model(
                     llm_service.merge_sub_agent_model_config(agent.get("modelConfig")),
@@ -198,32 +170,46 @@ class AgentExecutorService:
             else:
                 yield "该子 Agent 未返回有效内容。"
         else:
-            # No tools -- pure LLM streaming
             async for chunk in llm.astream(messages):
                 text = message_content_to_text(getattr(chunk, "content", ""))
                 if text:
                     yield text
 
+        with log_bind(agent_id=agent_id):
+            logger.info(
+                "Agent execution completed",
+                extra={
+                    "event": AGENT_EXECUTION_COMPLETED,
+                    "tool_rounds": tool_rounds,
+                    "latency_ms": round((time.perf_counter() - exec_start) * 1000),
+                },
+            )
+
     async def run_sub_agent(
         self,
         *,
         agent: Dict[str, Any],
-        task_query: str,
+        agent_id: str,
+        state: PaperMindState,
         chunk_callback: Optional[Callable[[str], Awaitable[None]]] = None,
-        context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, str]:
-        agent_id = str(agent.get("agent_id") or "")
+    ) -> Dict[str, Any]:
         agent_name = str(agent.get("name") or agent_id or "子 Agent")
         tools = await get_tools_for_agent(agent_id)
+        task_text = context_builder.get_sub_agent_human_content(
+            state,
+            agent_id=agent_id,
+            agent=agent,
+        )
+        evidence_packets: List[Dict[str, Any]] = []
 
         try:
             chunks: list[str] = []
             chunk_count = 0
             async for text in self.stream_sub_agent(
                 agent=agent,
-                task_query=task_query,
+                state=state,
                 tools=tools,
-                context=context,
+                evidence_packets=evidence_packets,
             ):
                 chunk_count += 1
                 if chunk_count == 1:
@@ -237,26 +223,29 @@ class AgentExecutorService:
                     await chunk_callback(text)
             content = "".join(chunks).strip()
             logger.info(
-                "子 Agent 模型输出完成: agent=%s chunks=%s content_len=%s",
+                "子 Agent 模型输出完成: agent=%s chunks=%s content_len=%s evidence=%s",
                 agent_id,
                 chunk_count,
                 len(content),
+                len(evidence_packets),
             )
             return {
                 "agent_id": agent_id,
                 "agent_name": agent_name,
-                "task": task_query,
+                "task": task_text,
                 "content": content or "该子 Agent 未返回有效内容。",
                 "error": "",
+                "evidence_packets": evidence_packets,
             }
         except Exception as exc:
             logger.exception("子 Agent 执行失败: agent=%s", agent_id)
             return {
                 "agent_id": agent_id,
                 "agent_name": agent_name,
-                "task": task_query,
+                "task": task_text,
                 "content": "",
                 "error": str(exc),
+                "evidence_packets": evidence_packets,
             }
 
     async def run_agent_for_run(
@@ -264,17 +253,18 @@ class AgentExecutorService:
         *,
         run_id: Optional[str],
         agent: Dict[str, Any],
-        task_query: str,
+        agent_id: str,
+        state: PaperMindState,
         chunk_callback: Optional[Callable[[str], Awaitable[None]]] = None,
-        context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         result = await self.run_sub_agent(
             agent=agent,
-            task_query=task_query,
+            agent_id=agent_id,
+            state=state,
             chunk_callback=chunk_callback,
-            context=context,
         )
-        # Check for MCP tool requests (external async compute, not LangChain tools)
+        task_text = str(result.get("task") or "")
+
         parsed = self.parse_result_content(result)
         if not parsed or not run_id:
             return result
@@ -286,7 +276,7 @@ class AgentExecutorService:
                 task = await orchestrator.submit_mcp_task(
                     run_id=run_id,
                     agent=agent,
-                    task_query=task_query,
+                    task_query=task_text,
                     result=result,
                     tool_name=str(first["tool_name"]),
                     arguments=first.get("arguments") or {},

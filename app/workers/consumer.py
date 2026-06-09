@@ -220,15 +220,10 @@ def _warmup_main_thread() -> None:
     logger.info("Warmup done (Docling ready).")
 
 
-def _setup_logging() -> None:
-    logging.basicConfig(
-        level=getattr(logging, settings.log_level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s",
-    )
-
-
 async def main() -> None:
-    _setup_logging()
+    from app.core.logging import setup_logging
+
+    setup_logging()
     _install_signal_handlers()
     logger.info("PaperMind worker starting (env={})", settings.app_env)
     try:

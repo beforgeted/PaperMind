@@ -14,6 +14,14 @@ from app.agent.graphs.paper_mind_graph import (
     SUSPEND_NODE,
     SUMMARIZE_NODE,
 )
+from app.core.log_context import bind, log_bind
+from app.observability.events import (
+    GRAPH_NODE_UPDATED,
+    MAIN_AGENT_DECISION,
+    MCP_TASK_SUBMITTED,
+    RUN_CREATED,
+    SUB_AGENT_STEP_COMPLETED,
+)
 from app.schemas.runtime_schema import AgentRunRecord, ComputeTaskRecord
 from app.services.run_service import agent_run_service
 from app.services.task_service import compute_task_service
@@ -55,8 +63,16 @@ class Orchestrator:
         context: Optional[Dict[str, Any]] = None,
     ) -> AgentRunRecord:
         """创建一次 AgentRun，并立即切换到 running 状态。"""
-        logger.info("创建 AgentRun: query_len=%s context_keys=%s", len(query or ""), sorted((context or {}).keys()))
         run = await self.agent_runs.create_run(query=query, context=context)
+        bind(run_id=run.run_id)
+        logger.info(
+            "AgentRun created",
+            extra={
+                "event": RUN_CREATED,
+                "query_len": len(query or ""),
+                "context_keys": sorted((context or {}).keys()),
+            },
+        )
         await self.agent_runs.mark_running(run.run_id)
         refreshed = await self.agent_runs.get_run(run.run_id)
         logger.info("AgentRun 进入 running: run_id=%s", run.run_id)
@@ -168,7 +184,15 @@ class Orchestrator:
                 "task_query": task_query,
             },
         )
-        logger.info("MCP 异步任务提交完成: run_id=%s agent=%s tool=%s task_id=%s", run_id, agent_id, tool_name, task.task_id)
+        logger.info(
+            "MCP task submitted",
+            extra={
+                "event": MCP_TASK_SUBMITTED,
+                "agent_id": agent_id,
+                "tool_name": tool_name,
+                "task_id": task.task_id,
+            },
+        )
         return await self.compute_tasks.get_task(task.task_id)
 
     async def build_resume_state(
@@ -182,13 +206,30 @@ class Orchestrator:
         if not run:
             raise ValueError(f"AgentRun 不存在: {run_id}")
         agents = await load_agents()
+        from app.agent.context import build_conversation_context
+
+        ctx = dict(run.context or {})
+        history_messages = list(ctx.get("history_messages") or [])
+        decision = run.decision or {}
+        conversation_context = (
+            build_conversation_context(
+                query=str(run.query or ""),
+                decision=decision,
+                history_messages=history_messages,
+            )
+            if decision
+            else {}
+        )
         return {
             "query": run.query,
-            "context": run.context,
+            "history_messages": history_messages,
+            "conversation_context": conversation_context,
+            "context": ctx,
             "agents": agents,
-            "decision": run.decision,
+            "decision": decision,
             "selected_agents": run.selected_agents,
             "agent_results": run.agent_results,
+            "evidence_packets": list(ctx.get("evidence_packets") or []),
             "pending_task_id": None,
             "pending_step_id": None,
         }
@@ -204,7 +245,15 @@ class Orchestrator:
         emit_events: bool,
     ) -> List[str]:
         """应用单个 LangGraph 节点更新，持久化状态并按需生成 SSE 事件。"""
-        logger.info("LangGraph 节点更新: run_id=%s node=%s keys=%s", run_id, node_name, sorted(node_update.keys()))
+        with log_bind(run_id=run_id):
+            logger.info(
+                "LangGraph node updated",
+                extra={
+                    "event": GRAPH_NODE_UPDATED,
+                    "node_name": node_name,
+                    "keys": sorted(node_update.keys()),
+                },
+            )
         events: List[str] = []
         state.update(node_update)
         await self.agent_runs.save_checkpoint(
@@ -240,10 +289,12 @@ class Orchestrator:
                         )
             )
             logger.info(
-                "MainAgent 决策完成: run_id=%s action=%s selected_agents=%s",
-                run_id,
-                decision.get("action"),
-                selected_agents,
+                "MainAgent decision completed",
+                extra={
+                    "event": MAIN_AGENT_DECISION,
+                    "action": decision.get("action"),
+                    "selected_agents": selected_agents,
+                },
             )
             return events
 
@@ -290,13 +341,16 @@ class Orchestrator:
                             }
                         )
                     )
-            logger.info(
-                "子智能体节点完成: run_id=%s agent=%s pending_task=%s error=%s",
-                run_id,
-                agent_id,
-                task_id or "",
-                bool(result.get("error")),
-            )
+            with log_bind(agent_id=agent_id):
+                logger.info(
+                    "Sub agent step completed",
+                    extra={
+                        "event": SUB_AGENT_STEP_COMPLETED,
+                        "content_len": len(str(result.get("content") or "")),
+                        "pending_task_id": task_id or "",
+                        "error": bool(result.get("error")),
+                    },
+                )
             return events
 
         if node_name == DIRECT_ANSWER_NODE:

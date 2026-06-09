@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 from app.core.logging import setup_logging
+from app.middleware.request_logging import RequestLoggingMiddleware
 from app.api.v1.router import api_v1_router
 from app.services.storage.kafka import get_kafka_producer
 from app.services.minio_service import MinIOService
@@ -89,6 +90,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestLoggingMiddleware)
 
 app.include_router(api_v1_router)
 

@@ -24,8 +24,13 @@ class Settings(BaseSettings):
     app_port: int = 2222
     debug: bool = False
     log_level: str = "INFO"
-    log_dir: str = "logs"
+    log_dir: str = "log"
     log_retention_days: int = 30
+    log_to_stdout: bool = True
+    log_json_to_file: bool = True
+    log_llm_payloads: bool = False
+    log_date_subdirs: bool = True
+    log_agent_business_file: bool = True
 
     # ==================== Database ====================
     database_url: str = Field(

@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 from langgraph.graph import END, START, StateGraph
 
 from app.agent.agents.agent_registry import CANONICAL_AGENT_ORDER
+from app.agent.context import build_conversation_context
 from app.agent.graphs.graph_state import PaperMindState, OrchestrateFn, RunAgentFn, SummarizeFn
 
 
@@ -48,41 +49,6 @@ def _next_agent_id(state: PaperMindState) -> Optional[str]:
     return None
 
 
-def _format_upstream_results(agent_results: List[Dict[str, str]]) -> str:
-    if not agent_results:
-        return "暂无上游 Agent 输出。"
-
-    blocks = []
-    for index, result in enumerate(agent_results, 1):
-        status = result.get("error") or result.get("content") or "无有效输出"
-        blocks.append(
-            "\n".join(
-                [
-                    f"{index}. {result.get('agent_name') or result.get('agent_id')}",
-                    f"任务：{result.get('task') or ''}",
-                    f"输出：\n{status}",
-                ]
-            )
-        )
-    return "\n\n".join(blocks)
-
-
-def _serial_task_query(
-    *,
-    query: str,
-    task_query: str,
-    agent_results: List[Dict[str, str]],
-) -> str:
-    return "\n\n".join(
-        [
-            f"用户原始需求：\n{query}",
-            f"当前阶段任务：\n{task_query}",
-            f"上游阶段输出：\n{_format_upstream_results(agent_results)}",
-            "请基于用户需求和上游输出完成本阶段任务；不要重复执行其他阶段职责。",
-        ]
-    )
-
-
 def create_paper_mind_graph(
     *,
     orchestrate: OrchestrateFn,
@@ -93,11 +59,19 @@ def create_paper_mind_graph(
 
     async def main_agent_node(state: PaperMindState) -> Dict[str, Any]:
         agents = state.get("agents") or []
-        decision = state.get("decision") or await orchestrate(query=state["query"], agents=agents)
+        decision = state.get("decision") or await orchestrate(state=state, agents=agents)
+        history = list(state.get("history_messages") or [])
+        conversation_context = build_conversation_context(
+            query=str(state.get("query") or ""),
+            decision=decision,
+            history_messages=history,
+        )
         return {
             "decision": decision,
+            "conversation_context": conversation_context,
             "selected_agents": _selected_agents(decision),
             "agent_results": state.get("agent_results") or [],
+            "evidence_packets": state.get("evidence_packets") or [],
             "pending_task_id": state.get("pending_task_id"),
             "pending_step_id": state.get("pending_step_id"),
         }
@@ -113,6 +87,7 @@ def create_paper_mind_graph(
     async def execute_sub_agent_node(state: PaperMindState) -> Dict[str, Any]:
         agent_id = _next_agent_id(state)
         prior_results = state.get("agent_results") or []
+        prior_evidence = list(state.get("evidence_packets") or [])
         if not agent_id:
             return {"agent_results": prior_results}
 
@@ -133,19 +108,12 @@ def create_paper_mind_graph(
                 ],
             }
 
-        decision = state.get("decision") or {}
-        queries_per_agent = decision.get("queries_per_agent") or {}
-        default_query = str(decision.get("query_for_agent") or state["query"])
-        base_task = str(queries_per_agent.get(agent_id) or default_query)
-        task_query = _serial_task_query(
-            query=state["query"],
-            task_query=base_task,
-            agent_results=prior_results,
-        )
-        result = await run_agent(agent=agent, task_query=task_query)
+        result = await run_agent(agent=agent, agent_id=agent_id, state=state)
+        new_evidence = list(result.pop("evidence_packets", None) or [])
         update: Dict[str, Any] = {
             "last_agent_id": agent_id,
             "agent_results": [*prior_results, result],
+            "evidence_packets": [*prior_evidence, *new_evidence],
         }
         if result.get("pending_task_id"):
             update["pending_task_id"] = result.get("pending_task_id")
@@ -171,11 +139,7 @@ def create_paper_mind_graph(
             decision = state.get("decision") or {}
             return {"final_report": str(decision.get("reason") or "抱歉，本次没有生成有效回答。")}
 
-        content = await summarize(
-            query=state["query"],
-            decision=state.get("decision") or {},
-            sub_agent_results=agent_results,
-        )
+        content = await summarize(state=state)
         return {"final_report": content or "抱歉，本次没有生成有效回答。"}
 
     async def direct_answer_node(state: PaperMindState) -> Dict[str, Any]:

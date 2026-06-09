@@ -10,12 +10,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from app.core.log_context import log_bind
+from app.observability.events import (
+    AGENT_CHAT_COMPLETED,
+    AGENT_CHAT_FAILED,
+    AGENT_CHAT_STARTED,
+)
 from app.services.chat_workflow_service import chat_workflow_service, json_line
 
 logger = logging.getLogger(__name__)
@@ -103,72 +110,98 @@ async def agent_chat(request: AgentChatRequest):
             detail="聊天服务繁忙，请稍后重试",
         )
 
+    start = time.perf_counter()
     try:
-        answer_parts: List[str] = []
-        tool_results: List[Dict[str, Any]] = []
-        used_tools: List[str] = []
-        sources: List[Dict[str, Any]] = []
+        with log_bind(session_id=request.session_id or ""):
+            logger.info(
+                "Agent chat started",
+                extra={
+                    "event": AGENT_CHAT_STARTED,
+                    "query_len": len(request.query or ""),
+                    "stream": False,
+                    "task_id": request.task_id or "",
+                },
+            )
+            answer_parts: List[str] = []
+            tool_results: List[Dict[str, Any]] = []
+            used_tools: List[str] = []
+            sources: List[Dict[str, Any]] = []
 
-        async for raw_line in chat_workflow_service.process_chat_stream(
-            query=request.query,
-            context={
-                "session_id": request.session_id,
-                "task_id": request.task_id,
-                "top_k": request.top_k,
-            },
-        ):
-            line = str(raw_line).strip()
-            if not line.startswith("data: "):
-                continue
-            try:
-                payload = json.loads(line[6:])
-            except json.JSONDecodeError:
-                continue
+            async for raw_line in chat_workflow_service.process_chat_stream(
+                query=request.query,
+                context={
+                    "session_id": request.session_id,
+                    "task_id": request.task_id,
+                    "top_k": request.top_k,
+                },
+            ):
+                line = str(raw_line).strip()
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    payload = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
 
-            event_type = payload.get("type")
-            content = payload.get("content", "")
-            channel = payload.get("channel")
+                event_type = payload.get("type")
+                content = payload.get("content", "")
+                channel = payload.get("channel")
 
-            if event_type == "content" and isinstance(content, str):
-                answer_parts.append(content)
-            elif event_type in ("sub_agent_delta", "summary_delta"):
-                # Accumulate streaming delta text into the answer
-                delta_text = str(payload.get("content", ""))
-                if delta_text:
-                    answer_parts.append(delta_text)
-            elif event_type == "done" and isinstance(content, str):
-                if content not in answer_parts:
+                if event_type == "content" and isinstance(content, str):
                     answer_parts.append(content)
-            elif event_type == "tool_result" and isinstance(payload, dict):
-                tool_results.append(payload)
-                if channel:
-                    used_tools.append(channel)
-                # Extract paper sources from tool result content
-                extracted = _extract_sources_from_payload(payload)
-                sources.extend(extracted)
-            elif event_type == "error":
-                if content and isinstance(content, str):
-                    raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=content)
+                elif event_type in ("sub_agent_delta", "summary_delta"):
+                    delta_text = str(payload.get("content", ""))
+                    if delta_text:
+                        answer_parts.append(delta_text)
+                elif event_type == "done" and isinstance(content, str):
+                    if content not in answer_parts:
+                        answer_parts.append(content)
+                elif event_type == "tool_result" and isinstance(payload, dict):
+                    tool_results.append(payload)
+                    if channel:
+                        used_tools.append(channel)
+                    extracted = _extract_sources_from_payload(payload)
+                    sources.extend(extracted)
+                elif event_type == "error":
+                    if content and isinstance(content, str):
+                        raise HTTPException(
+                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail=content,
+                        )
 
-        final_answer = "\n\n".join(filter(None, answer_parts))
+            final_answer = "\n\n".join(filter(None, answer_parts))
 
-        # Fallback: extract citation markers from the answer text if no
-        # structured tool_results provided sources
-        if not sources:
-            sources.extend(_extract_sources_from_text(final_answer))
+            if not sources:
+                sources.extend(_extract_sources_from_text(final_answer))
 
-        return {
-            "query": request.query,
-            "answer": final_answer,
-            "contexts": tool_results,
-            "sources": sources,
-            "used_tools": list(dict.fromkeys(used_tools)),  # 去重保序
-        }
+            logger.info(
+                "Agent chat completed",
+                extra={
+                    "event": AGENT_CHAT_COMPLETED,
+                    "latency_ms": round((time.perf_counter() - start) * 1000),
+                    "answer_len": len(final_answer),
+                    "stream": False,
+                },
+            )
+            return {
+                "query": request.query,
+                "answer": final_answer,
+                "contexts": tool_results,
+                "sources": sources,
+                "used_tools": list(dict.fromkeys(used_tools)),
+            }
 
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Agent 非流式对话异常: %s", exc)
+        logger.exception(
+            "Agent chat failed",
+            extra={
+                "event": AGENT_CHAT_FAILED,
+                "stream": False,
+                "latency_ms": round((time.perf_counter() - start) * 1000),
+            },
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"对话处理失败: {str(exc)}",
@@ -196,6 +229,8 @@ async def agent_chat_stream(request: AgentChatRequest):
             detail="聊天服务繁忙，请稍后重试",
         )
 
+    stream_start = time.perf_counter()
+
     sentinel = object()
     client_disconnected = asyncio.Event()
     queue: asyncio.Queue[object] = asyncio.Queue(maxsize=_STREAM_QUEUE_MAX)
@@ -210,17 +245,34 @@ async def agent_chat_stream(request: AgentChatRequest):
 
     async def run_task() -> None:
         try:
-            async for chunk in chat_workflow_service.process_chat_stream(
-                query=request.query,
-                context={
-                    "session_id": request.session_id,
-                    "task_id": request.task_id,
-                    "top_k": request.top_k,
-                },
-            ):
-                await enqueue(str(chunk))
+            with log_bind(session_id=request.session_id or ""):
+                logger.info(
+                    "Agent chat started",
+                    extra={
+                        "event": AGENT_CHAT_STARTED,
+                        "query_len": len(request.query or ""),
+                        "stream": True,
+                        "task_id": request.task_id or "",
+                    },
+                )
+                async for chunk in chat_workflow_service.process_chat_stream(
+                    query=request.query,
+                    context={
+                        "session_id": request.session_id,
+                        "task_id": request.task_id,
+                        "top_k": request.top_k,
+                    },
+                ):
+                    await enqueue(str(chunk))
         except Exception as exc:
-            logger.exception("Agent 流式后台任务异常: %s", exc)
+            logger.exception(
+                "Agent chat failed",
+                extra={
+                    "event": AGENT_CHAT_FAILED,
+                    "stream": True,
+                    "latency_ms": round((time.perf_counter() - stream_start) * 1000),
+                },
+            )
             await enqueue(json_line({"type": "error", "content": str(exc)}))
         finally:
             try:
@@ -296,6 +348,15 @@ async def agent_chat_stream(request: AgentChatRequest):
                         # if no structured tool_results provided sources
                         if not sources:
                             sources.extend(_extract_sources_from_text(final_answer))
+                        logger.info(
+                            "Agent chat completed",
+                            extra={
+                                "event": AGENT_CHAT_COMPLETED,
+                                "latency_ms": round((time.perf_counter() - stream_start) * 1000),
+                                "answer_len": len(final_answer),
+                                "stream": True,
+                            },
+                        )
                         yield json_line(
                             {
                                 "type": "done",

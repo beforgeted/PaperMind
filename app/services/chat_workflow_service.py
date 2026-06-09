@@ -5,9 +5,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional
 
 from app.agent.agents.agent_registry import list_registry_items
+from app.core.log_context import log_bind
+from app.observability.events import (
+    CHAT_STREAM_COMPLETED,
+    CHAT_STREAM_FAILED,
+    CHAT_STREAM_STARTED,
+)
 from app.agent.agents.main_agent import main_agent
 from app.agent.graphs.paper_mind_graph import create_paper_mind_graph
 from app.services.agent_executor_service import agent_executor_service
@@ -149,9 +156,20 @@ class ChatWorkflowService:
     async def _load_enabled_agents(self) -> List[Dict[str, Any]]:
         return list_registry_items()
 
-    async def _orchestrate(self, *, query: str, agents: List[Dict[str, Any]]) -> Dict[str, Any]:
-        logger.info("MainAgent 开始识别意图: query_len=%s agents=%s", len(query or ""), len(agents))
-        return await main_agent.recognize_intent(query=query, agents=agents)
+    async def _orchestrate(
+        self,
+        *,
+        state: Dict[str, Any],
+        agents: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        history_messages = list(state.get("history_messages") or [])
+        logger.info(
+            "MainAgent 开始识别意图: query_len=%s agents=%s history_turns=%s",
+            len(str(state.get("query") or "")),
+            len(agents),
+            len(history_messages),
+        )
+        return await main_agent.recognize_intent(state=state, agents=agents)
 
     def _create_graph(
         self,
@@ -168,10 +186,13 @@ class ChatWorkflowService:
         """
         _ctx = dict(context or {})
 
-        async def run_agent(agent: Dict[str, Any], task_query: str) -> Dict[str, Any]:
-            agent_id = str(agent.get("agent_id") or "")
-            agent_name = str(agent.get("name") or agent.get("agent_id") or "子智能体")
-            logger.info("子智能体开始执行: agent=%s task_len=%s", agent_id, len(task_query or ""))
+        async def run_agent(
+            agent: Dict[str, Any],
+            agent_id: str,
+            state: Dict[str, Any],
+        ) -> Dict[str, Any]:
+            agent_name = str(agent.get("name") or agent_id or "子智能体")
+            logger.info("子智能体开始执行: agent=%s", agent_id)
 
             if event_callback is not None:
                 await event_callback(
@@ -186,9 +207,9 @@ class ChatWorkflowService:
             result = await agent_executor_service.run_agent_for_run(
                 run_id=run_id,
                 agent=agent,
-                task_query=task_query,
+                agent_id=agent_id,
+                state=state,
                 chunk_callback=None,
-                context=_ctx,
             )
             logger.info(
                 "子智能体执行结束: agent=%s content_len=%s error=%s pending_task=%s",
@@ -199,12 +220,14 @@ class ChatWorkflowService:
             )
             return result
 
-        async def summarize(
-            query: str,
-            decision: Dict[str, Any],
-            sub_agent_results: List[Dict[str, str]],
-        ) -> str:
-            logger.info("最终汇总开始: sub_agent_results=%s", len(sub_agent_results))
+        async def summarize(state: Dict[str, Any]) -> str:
+            agent_results = list(state.get("agent_results") or [])
+            history_messages = list(state.get("history_messages") or [])
+            logger.info(
+                "最终汇总开始: sub_agent_results=%s history_turns=%s",
+                len(agent_results),
+                len(history_messages),
+            )
 
             async def on_chunk(text: str) -> None:
                 if event_callback is None:
@@ -220,9 +243,7 @@ class ChatWorkflowService:
                 )
 
             content = await summary_service.summarize_results(
-                query=query,
-                decision=decision,
-                sub_agent_results=sub_agent_results,
+                state=state,
                 chunk_callback=on_chunk if event_callback is not None else None,
             )
             logger.info("最终汇总完成: content_len=%s", len(content or ""))
@@ -329,161 +350,224 @@ class ChatWorkflowService:
         query: str,
         context: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[str, None]:
-        logger.info("聊天 SSE 请求开始: query_len=%s context_keys=%s", len(query or ""), sorted((context or {}).keys()))
-        yield json_line({"type": "status", "content": "SSE 连接已建立，开始处理聊天请求"})
-
+        stream_start = time.perf_counter()
         _ctx = dict(context or {})
+        session_id = str(_ctx.get("session_id") or "")
 
-        # Store the original (raw) user query so write-back paths always use
-        # it for the user turn — never the enriched version that contains
-        # injected conversation history.
-        _ctx["__original_query"] = query
+        with log_bind(session_id=session_id):
+            logger.info(
+                "Chat stream started",
+                extra={
+                    "event": CHAT_STREAM_STARTED,
+                    "query_len": len(query or ""),
+                    "context_keys": sorted(_ctx.keys()),
+                },
+            )
+            yield json_line({"type": "status", "content": "SSE 连接已建立，开始处理聊天请求"})
 
-        # Issue #8: load conversation history from Redis session store when
-        # session_id is provided, and enrich the initial query with dialogue context.
-        enriched_query = query
-        session_id = _ctx.get("session_id") or ""
-        is_first_turn = False
-        if session_id:
-            try:
-                from app.services.memory.session_store import get_session_store
+            # Store the original (raw) user query so write-back paths always use
+            # it for the user turn — never the enriched version that contains
+            # injected conversation history.
+            _ctx["__original_query"] = query
 
-                store = get_session_store()
-                store.ensure_session(session_id)
-                prior_turns = store.get_history(session_id, max_turns=1, as_messages=False)
-                is_first_turn = len(prior_turns) == 0
-                history_text = store.build_context_for_prompt(
-                    session_id, query, max_history_turns=8
-                )
-                if history_text:
-                    enriched_query = history_text
-                    logger.info(
-                        "会话历史注入成功: session_id=%s history_chars=%s",
+            # 加载近 10 轮 role/content 历史：Redis 优先，缺失时回源 ES 并回填 Redis。
+            is_first_turn = False
+            if session_id:
+                try:
+                    from app.services.memory.session_store import (
+                        DEFAULT_WINDOW_SIZE,
+                        get_session_store,
+                    )
+
+                    store = get_session_store()
+                    store.ensure_session(session_id)
+                    history_messages = store.load_history_messages(
                         session_id,
-                        len(history_text),
+                        max_turns=DEFAULT_WINDOW_SIZE,
                     )
-            except Exception as exc:
-                logger.warning("加载会话历史失败: session_id=%s error=%s", session_id, exc)
-
-        run = await orchestrator.create_agent_run(query=enriched_query, context=_ctx)
-        logger.info("AgentRun 已创建: run_id=%s", run.run_id)
-        agents = await self._load_enabled_agents()
-        logger.info("已加载子智能体: run_id=%s count=%s", run.run_id, len(agents))
-        queue: asyncio.Queue[object] = asyncio.Queue()
-        sentinel = object()
-
-        async def emit_event(data: Dict[str, Any]) -> None:
-            await queue.put(json_line(data))
-
-        graph = self._create_graph(
-            run_id=run.run_id, event_callback=emit_event, context=_ctx
-        )
-        state: Dict[str, Any] = {
-            "query": enriched_query,
-            "context": _ctx,
-            "agents": agents,
-            "agent_results": [],
-        }
-
-        yield json_line({"type": "run", "content": json.dumps(run.model_dump(), ensure_ascii=False)})
-        yield json_line({"type": "status", "content": "LangGraph 工作流启动：主智能体正在识别意图"})
-
-        async def run_workflow() -> None:
-            try:
-                logger.info("LangGraph 工作流开始: run_id=%s", run.run_id)
-                async for event in orchestrator.stream_graph_events(
-                    run_id=run.run_id,
-                    graph=graph,
-                    state=state,
-                    agents=agents,
-                ):
-                    await queue.put(event)
-
-                pending_task_id = state.get("pending_task_id")
-                if pending_task_id:
-                    logger.info("工作流出现 pending_task: run_id=%s task_id=%s", run.run_id, pending_task_id)
-                    pending_task = await orchestrator.compute_tasks.get_task(str(pending_task_id))
-                    if pending_task and pending_task.kind == "external_compute":
-                        response_content = str(state.get("final_report") or "工作流已挂起，等待外部计算任务完成。")
-                        logger.info("工作流挂起等待外部计算: run_id=%s task_id=%s", run.run_id, pending_task_id)
-                        await queue.put(json_line({"type": "done", "content": response_content}))
-                        return
-                    async for event in self._wait_for_run_terminal(run_id=run.run_id):
-                        await queue.put(event)
-                    return
-
-                response_content = str(state.get("final_report") or "").strip()
-                if not response_content:
-                    response_content = "抱歉，本次没有生成有效回答。"
-                    await queue.put(json_line({"type": "content", "content": response_content}))
-
-                tool_results = self._extract_tool_results(state.get("agent_results") or [])
-                for item in tool_results:
-                    await queue.put(
-                        json_line(
-                            {
-                                "type": "tool_result",
-                                "channel": "execution",
-                                **item,
-                            }
+                    is_first_turn = len(history_messages) == 0
+                    if history_messages:
+                        _ctx["history_messages"] = history_messages
+                        logger.info(
+                            "会话历史注入成功: session_id=%s turns=%s",
+                            session_id,
+                            len(history_messages),
                         )
-                    )
-                sid = _ctx.get("session_id") or ""
-                raw_user_query = str(_ctx.get("__original_query") or query)
-                if sid and response_content:
+                    else:
+                        logger.info("无会话历史: session_id=%s", session_id)
+                except Exception as exc:
+                    logger.warning("加载会话历史失败: session_id=%s error=%s", session_id, exc)
+
+            run = await orchestrator.create_agent_run(query=query, context=_ctx)
+
+            with log_bind(run_id=run.run_id):
+                logger.info("AgentRun 已创建: run_id=%s", run.run_id)
+                agents = await self._load_enabled_agents()
+                logger.info("已加载子智能体: run_id=%s count=%s", run.run_id, len(agents))
+                queue: asyncio.Queue[object] = asyncio.Queue()
+                sentinel = object()
+
+                async def emit_event(data: Dict[str, Any]) -> None:
+                    await queue.put(json_line(data))
+
+                graph = self._create_graph(
+                    run_id=run.run_id, event_callback=emit_event, context=_ctx
+                )
+                state: Dict[str, Any] = {
+                    "query": query,
+                    "history_messages": list(_ctx.get("history_messages") or []),
+                    "conversation_context": {},
+                    "context": _ctx,
+                    "agents": agents,
+                    "agent_results": [],
+                    "evidence_packets": [],
+                }
+
+                yield json_line({"type": "run", "content": json.dumps(run.model_dump(), ensure_ascii=False)})
+                yield json_line({"type": "status", "content": "LangGraph 工作流启动：主智能体正在识别意图"})
+
+                async def run_workflow() -> None:
                     try:
-                        self._persist_session_turns(
-                            session_id=sid,
-                            user_query=raw_user_query,
-                            assistant_content=response_content,
-                            context=_ctx,
+                        logger.info("LangGraph 工作流开始: run_id=%s", run.run_id)
+                        async for event in orchestrator.stream_graph_events(
+                            run_id=run.run_id,
+                            graph=graph,
+                            state=state,
+                            agents=agents,
+                        ):
+                            await queue.put(event)
+
+                        pending_task_id = state.get("pending_task_id")
+                        if pending_task_id:
+                            logger.info(
+                                "工作流出现 pending_task: run_id=%s task_id=%s",
+                                run.run_id,
+                                pending_task_id,
+                            )
+                            pending_task = await orchestrator.compute_tasks.get_task(
+                                str(pending_task_id)
+                            )
+                            if pending_task and pending_task.kind == "external_compute":
+                                response_content = str(
+                                    state.get("final_report")
+                                    or "工作流已挂起，等待外部计算任务完成。"
+                                )
+                                logger.info(
+                                    "工作流挂起等待外部计算: run_id=%s task_id=%s",
+                                    run.run_id,
+                                    pending_task_id,
+                                )
+                                await queue.put(
+                                    json_line({"type": "done", "content": response_content})
+                                )
+                                return
+                            async for event in self._wait_for_run_terminal(run_id=run.run_id):
+                                await queue.put(event)
+                            return
+
+                        response_content = str(state.get("final_report") or "").strip()
+                        if not response_content:
+                            response_content = "抱歉，本次没有生成有效回答。"
+                            await queue.put(
+                                json_line({"type": "content", "content": response_content})
+                            )
+
+                        tool_results = self._extract_tool_results(
+                            state.get("agent_results") or []
                         )
-                    except Exception:
-                        pass
-                if sid and response_content:
-                    try:
-                        raw_user_query = str(_ctx.get("__original_query") or query)
-                        new_title = await self._maybe_update_session_title(
-                            session_id=sid,
-                            user_query=raw_user_query,
-                            is_first_turn=is_first_turn,
-                        )
-                        if new_title:
+                        for item in tool_results:
                             await queue.put(
                                 json_line(
                                     {
-                                        "type": "status",
-                                        "phase": "title",
-                                        "title": new_title,
+                                        "type": "tool_result",
+                                        "channel": "execution",
+                                        **item,
                                     }
                                 )
                             )
+                        sid = _ctx.get("session_id") or ""
+                        raw_user_query = str(_ctx.get("__original_query") or query)
+                        if sid and response_content:
+                            try:
+                                self._persist_session_turns(
+                                    session_id=sid,
+                                    user_query=raw_user_query,
+                                    assistant_content=response_content,
+                                    context=_ctx,
+                                )
+                            except Exception:
+                                pass
+                        if sid and response_content:
+                            try:
+                                new_title = await self._maybe_update_session_title(
+                                    session_id=sid,
+                                    user_query=raw_user_query,
+                                    is_first_turn=is_first_turn,
+                                )
+                                if new_title:
+                                    await queue.put(
+                                        json_line(
+                                            {
+                                                "type": "status",
+                                                "phase": "title",
+                                                "title": new_title,
+                                            }
+                                        )
+                                    )
+                            except Exception as exc:
+                                logger.warning(
+                                    "会话标题更新失败: session_id=%s error=%s", sid, exc
+                                )
+                        logger.info(
+                            "LangGraph 工作流结束: run_id=%s final_len=%s",
+                            run.run_id,
+                            len(response_content or ""),
+                        )
+                        logger.info(
+                            "Chat stream completed",
+                            extra={
+                                "event": CHAT_STREAM_COMPLETED,
+                                "latency_ms": round(
+                                    (time.perf_counter() - stream_start) * 1000
+                                ),
+                                "final_len": len(response_content or ""),
+                            },
+                        )
+                        await queue.put(
+                            json_line({"type": "done", "content": response_content})
+                        )
                     except Exception as exc:
-                        logger.warning("会话标题更新失败: session_id=%s error=%s", sid, exc)
-                logger.info("LangGraph 工作流结束: run_id=%s final_len=%s", run.run_id, len(response_content or ""))
-                await queue.put(json_line({"type": "done", "content": response_content}))
-            except Exception as exc:
-                logger.exception("LangGraph 工作流异常: run_id=%s error=%s", run.run_id, exc)
-                await orchestrator.fail_run(run_id=run.run_id, error=str(exc))
-                await queue.put(self.error_chunk(str(exc)))
-            finally:
-                await queue.put(sentinel)
+                        logger.exception(
+                            "Chat stream failed",
+                            extra={
+                                "event": CHAT_STREAM_FAILED,
+                                "latency_ms": round(
+                                    (time.perf_counter() - stream_start) * 1000
+                                ),
+                            },
+                        )
+                        await orchestrator.fail_run(run_id=run.run_id, error=str(exc))
+                        await queue.put(self.error_chunk(str(exc)))
+                    finally:
+                        await queue.put(sentinel)
 
-        workflow_task = asyncio.create_task(run_workflow())
-        try:
-            while True:
-                event = await queue.get()
-                if event is sentinel:
-                    break
-                yield str(event)
-        finally:
-            if not workflow_task.done():
-                logger.info("客户端断开或生成器结束，取消工作流: run_id=%s", run.run_id)
-                workflow_task.cancel()
+                workflow_task = asyncio.create_task(run_workflow())
                 try:
-                    await workflow_task
-                except asyncio.CancelledError:
-                    pass
+                    while True:
+                        event = await queue.get()
+                        if event is sentinel:
+                            break
+                        yield str(event)
+                finally:
+                    if not workflow_task.done():
+                        logger.info(
+                            "客户端断开或生成器结束，取消工作流: run_id=%s", run.run_id
+                        )
+                        workflow_task.cancel()
+                        try:
+                            await workflow_task
+                        except asyncio.CancelledError:
+                            pass
 
 
 chat_workflow_service = ChatWorkflowService()

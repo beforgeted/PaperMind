@@ -74,7 +74,8 @@ class TurnRecord:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "TurnRecord":
+    def from_dict(cls, d: dict[str, Any], *, allow_long: bool = True) -> "TurnRecord":
+        """从 Redis / ES 反序列化；默认保留完整 content，避免二次截断。"""
         return cls(
             turn_id=d.get("turn_id", ""),
             role=d.get("role", "user"),
@@ -83,6 +84,7 @@ class TurnRecord:
             timestamp=d.get("timestamp", ""),
             used_tools=list(d.get("used_tools") or []),
             metadata=dict(d.get("metadata") or {}),
+            allow_long=allow_long,
         )
 
 
@@ -217,6 +219,20 @@ class SessionStore:
         If as_messages=True, returns [{"role": "user", "content": "..."}, ...] in chronological order.
         Otherwise returns list of TurnRecord in newest-first order.
         """
+        turns = self._read_redis_turns(session_id, max_turns=max_turns)
+        if as_messages:
+            from app.services.memory.message_utils import turns_to_history_messages
+
+            return turns_to_history_messages(list(reversed(turns)))  # type: ignore[return-value]
+        return turns  # type: ignore[return-value]
+
+    def _read_redis_turns(
+        self,
+        session_id: str,
+        *,
+        max_turns: int | None = None,
+    ) -> list[TurnRecord]:
+        """从 Redis 读取 turn 列表（newest-first）。"""
         hkey = self.history_key(session_id)
         limit = max_turns or self.window_size
         raw = self._redis.lrange(hkey, 0, limit - 1)
@@ -227,18 +243,73 @@ class SessionStore:
                 turns.append(TurnRecord.from_dict(json.loads(item)))
             except (json.JSONDecodeError, TypeError):
                 continue
+        return turns
 
-        if as_messages:
-            # Chronological order (oldest first) for LLM prompt injection
-            messages: list[dict[str, str]] = []
-            for t in reversed(turns):
-                role = t.role
-                if role not in ("user", "assistant"):
-                    role = "user" if t.role in ("human", "user") else "assistant"
-                messages.append({"role": role, "content": t.content})
-            return messages  # type: ignore[return-value]
+    def has_redis_history(self, session_id: str) -> bool:
+        """Redis 中是否存在会话历史。"""
+        return bool(self._redis.exists(self.history_key(session_id)))
 
-        return turns  # type: ignore[return-value]
+    def restore_history(self, session_id: str, turns: list[TurnRecord]) -> None:
+        """用 ES 等来源的 turn 回填 Redis 滑动窗口（turns 为时间正序）。"""
+        self.ensure_session(session_id)
+        hkey = self.history_key(session_id)
+        capped = turns[-self.window_size :]
+        pipe = self._redis.pipeline()
+        pipe.delete(hkey)
+        # 按时间正序 LPUSH，使最新 turn 留在列表头部（与 append_turn 一致）
+        for turn in capped:
+            pipe.lpush(hkey, json.dumps(turn.to_dict(), ensure_ascii=False))
+        pipe.ltrim(hkey, 0, self.window_size - 1)
+        pipe.execute()
+        self._refresh_ttl(session_id)
+        logger.info(
+            "SessionStore: restored {} turns to Redis for {}",
+            len(capped),
+            session_id,
+        )
+
+    def _turn_from_es_dict(self, payload: dict[str, Any]) -> TurnRecord:
+        """将 ES turn 文档转为 TurnRecord（保留完整字段）。"""
+        return TurnRecord(
+            turn_id=str(payload.get("turn_id") or ""),
+            role=str(payload.get("role") or "user"),
+            content=str(payload.get("content") or ""),
+            intent=str(payload.get("intent") or ""),
+            timestamp=str(payload.get("timestamp") or ""),
+            used_tools=list(payload.get("used_tools") or []),
+            metadata=dict(payload.get("metadata") or {}),
+            allow_long=True,
+        )
+
+    def load_history_messages(
+        self,
+        session_id: str,
+        max_turns: int | None = None,
+    ) -> list[dict[str, str]]:
+        """加载近 N 轮对话为 role/content 列表（时间正序、完整 content）。
+
+        优先 Redis 热缓存；若无则回源 ES 最近 N 轮并回填 Redis。
+        两侧均无数据时返回空列表。
+        """
+        limit = max_turns or self.window_size
+        redis_turns = self._read_redis_turns(session_id, max_turns=limit)
+        if redis_turns:
+            from app.services.memory.message_utils import turns_to_history_messages
+
+            return turns_to_history_messages(list(reversed(redis_turns)))
+
+        from app.services.memory.episodic import EpisodicMemory
+        from app.services.memory.message_utils import turns_to_history_messages
+
+        episodic = EpisodicMemory()
+        es_turns = episodic.recall(session_id=session_id, limit=limit)
+        if not es_turns:
+            return []
+
+        chronological = [self._turn_from_es_dict(item) for item in es_turns]
+        self.restore_history(session_id, chronological)
+        redis_turns = self._read_redis_turns(session_id, max_turns=limit)
+        return turns_to_history_messages(list(reversed(redis_turns)))
 
     def get_turn_count(self, session_id: str) -> int:
         """Get the current number of turns in the session."""
@@ -279,20 +350,16 @@ class SessionStore:
         current_query: str,
         max_history_turns: int = 10,
     ) -> str:
-        """Build a compact context block from session history for prompt injection.
-
-        Used by memory_recall_node to inject conversation continuity.
-        """
-        turns = self.get_history(session_id, max_turns=max_history_turns, as_messages=True)
-        if not turns:
+        """兼容旧接口：返回 role/content 序列化文本（完整 content，不截断）。"""
+        history = self.load_history_messages(session_id, max_turns=max_history_turns)
+        if not history:
             return ""
 
-        parts: list[str] = ["## 对话历史 (最近 {} 轮)".format(len(turns))]
-        for i, msg in enumerate(turns):
-            role_label = "用户" if msg["role"] == "user" else "助手"
-            content_short = msg["content"][:200]
-            parts.append(f"[{i + 1}] {role_label}: {content_short}")
-
+        parts: list[str] = [f"## 对话历史 (最近 {len(history)} 轮)"]
+        for index, msg in enumerate(history, 1):
+            parts.append(
+                f"[{index}] role={msg['role']}\ncontent:\n{msg['content']}"
+            )
         parts.append(f"\n## 当前问题\n{current_query}")
         return "\n".join(parts)
 

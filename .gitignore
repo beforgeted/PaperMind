@@ -18,7 +18,7 @@ frontend/dist/
 
 # Data & logs
 volumes/
-logs/
+log/
 uploads/
 
 # IDE & tooling
