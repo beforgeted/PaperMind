@@ -1,343 +1,339 @@
 # PaperMind Multi-Agent
 
-PaperMind 是一个面向学术研究的 **Multi-Agent 知识库系统**。支持 PDF 上传、异步解析、Parent-Child 切分、Elasticsearch 混合检索、三层记忆系统（Redis + ES）、以及一个基于 LangGraph 编排器的 **多 Agent 对话入口**。
+PaperMind 是面向学术研究的 **Multi-Agent 知识库系统**：支持 PDF 上传与异步解析、Elasticsearch 混合检索、三层记忆（Redis + ES）、基于 LangGraph 的多 Agent 编排，以及 React 前端的 SSE 流式对话。
+
+---
 
 ## 架构概览
 
-PaperMind 的核心目标是把"论文知识库"包装成一个可持续对话的研究助手，并通过多个专业 Agent 分工协作来提升回答质量。
+### 用户视角：1 个主 Agent + 4 个子 Agent
 
-### 子 Agent 分工（用户视角）
-
-系统由 **1 个主 Agent + 4 个专业子 Agent** 协作；主 Agent 只做意图识别与调度，**不直接调工具**。子 Agent 按任务类型选用，最终由 **汇总节点** 合成一条面向用户的回答。
+主 Agent **只做意图识别与调度**，不直接调用工具。子 Agent 按流水线串行执行，最终由 **汇总节点** 合成一条面向用户的流式回答。
 
 
-| 子 Agent        | `agent_id`        | 你能用它做什么                                   | 典型触发场景                  |
-| -------------- | ----------------- | ----------------------------------------- | ----------------------- |
-| **主 Agent**    | —（编排器）            | 理解问题、拆任务、决定派谁                             | 所有对话入口（自动运行，用户无感）       |
-| **检索 Agent**   | `retrieval-agent` | 查知识库、找证据、RAG 问答；**唯一**可调外网 arXiv/PubMed 等 | 「找论文」「知识库里有什么」「某主题相关片段」 |
-| **论文发现 Agent** | `profile-agent`   | 论文列表推荐、单篇画像（方法/贡献/摘要）                     | 「有哪些相关论文」「这篇论文讲了什么」     |
-| **综述 Agent**   | `summary-agent`   | 基于检索结果写文献综述、梳理研究脉络                        | 「写综述」「总结研究现状」「领域进展」     |
-| **写作 Agent**   | `writing-agent`   | 学术润色、同行评审、草稿与写作辅助                         | 「润色这段」「审稿」「按大纲写一段」      |
+| 角色 | `agent_id` | 用途 | 典型问题 |
+|------|------------|------|----------|
+| **主 Agent** | — | 理解意图、拆任务、输出路由计划 | 所有对话入口（自动） |
+| **检索 Agent** | `retrieval-agent` | 知识库检索、证据、RAG；可接外网文献 MCP | 「找论文」「知识库里有什么」 |
+| **发现 Agent** | `profile-agent` | 论文列表、单篇画像 | 「这篇讲什么」「推荐相关论文」 |
+| **综述 Agent** | `summary-agent` | 基于证据写文献综述 | 「写综述」「梳理研究现状」 |
+| **写作 Agent** | `writing-agent` | 润色、审稿、写作辅助 | 「润色这段」「按大纲写」 |
 
+常见组合：**综述** ≈ 检索 → 综述；**查资料再写** ≈ 检索 → 写作。闲聊/问候走 `direct_answer`，不跑子 Agent。
 
-常见组合：**综述** ≈ 检索 Agent → 综述 Agent；**写作前查资料** ≈ 检索 Agent → 写作 Agent。简单闲聊由主 Agent **直接回答**，不经过子 Agent 工具链。
-
-### 系统分层（技术视角）
+### 技术分层
 
 ```
-┌─ 前端体验层 ─────────────────────────────────────────────┐
-│  React / Vite — SSE 流式对话、知识库、会话历史             │
-└────────────────────────────┬─────────────────────────────┘
-                             │ FastAPI (/api/v1/agent, sessions, papers, mcp)
-┌─ Agent 编排层 ─────────────▼─────────────────────────────┐
-│  Main Agent（意图路由）                                    │
-│    ├─ Retrieval Agent  → 论文检索、证据、RAG、外网文献      │
-│    ├─ Profile Agent    → 论文列表 / 单篇画像               │
-│    ├─ Summary Agent    → 文献综述                          │
-│    └─ Writing Agent    → 润色 / 审稿 / 写作辅助             │
-│  → summarize_node 汇总 → 一条 SSE 流式回答                  │
-└────────────────────────────┬─────────────────────────────┘
-                             │ 
-┌─ MCP 工具层 ───────────────▼─────────────────────────────┐
-│  mcp_gateway → papermind-retrieval（本地 ES 检索）        │
-│              → paper-search（外网，仅 Retrieval Agent）   │
-└────────────────────────────┬─────────────────────────────┘
-                             │
-┌─ 数据与基础设施 ───────────▼─────────────────────────────┐
-│  领域服务：retrieval / qa / papers / 三层记忆               │
-│  入库流水线：Kafka Worker → Docling → 切分 → ES            │
-│  MinIO · Redis · Elasticsearch · MySQL(可选)              │
-└──────────────────────────────────────────────────────────┘
+┌─ 前端 ─────────────────────────────────────────────────┐
+│  React / Vite — SSE 流式对话、知识库、会话历史          │
+└──────────────────────────┬───────────────────────────┘
+                           │  FastAPI  /api/v1/*
+┌─ Agent 编排 ─────────────▼───────────────────────────┐
+│  GraphState（状态黑板）                               │
+│    query / history_messages / decision /              │
+│    conversation_context / agent_results /             │
+│    evidence_packets                                   │
+│  ContextBuilder（上下文装配器）                        │
+│    → 按阶段/Agent 策略组装 LLM messages               │
+│  LangGraph: main_agent → sub_agents* → summarize      │
+└──────────────────────────┬───────────────────────────┘
+                           │
+┌─ MCP 工具层 ─────────────▼───────────────────────────┐
+│  mcp_gateway → papermind-retrieval（本地 ES）         │
+│              → paper-search（外网，仅检索 Agent）     │
+└──────────────────────────┬───────────────────────────┘
+                           │
+┌─ 数据与基础设施 ─────────▼───────────────────────────┐
+│  检索 / QA / 论文服务 / 三层记忆                       │
+│  Kafka Worker → Docling → 切分 → Embedding → ES       │
+│  MinIO · Redis · Elasticsearch · MySQL（可选）        │
+└──────────────────────────────────────────────────────┘
 ```
 
-**核心亮点：**
+**核心能力**
 
-- **Multi-Agent 编排**: Main Agent 负责意图识别与任务拆解，4 个子 Agent 分工执行（检索、写作、综述、画像发现），最终由汇总节点合成统一回答。
-- **Tool-Calling 检索（模式 A / MCP）**: Agent 工具由 MCP Server 暴露，经 `mcp_gateway` 统一调用；本地 `papermind-retrieval` + 可选外部 `paper-search` MCP，便于后续接入第三方 MCP。
-- **文件上传与异步解析**: PDF 上传后进入 Kafka + Worker 的异步解析流水线，Docling 解析、切分、embedding 与索引由 Worker 后台完成。
-- **三层记忆系统**: Redis SessionStore 管理热会话滑动窗口；ES Episodic 永久存档完整对话；ES Semantic 存储长期知识记忆。
-- **前后端分离**: React / Vite 前端提供流式对话、会话切换、知识库管理和引用来源查看。
+- **Multi-Agent 编排**：Main Agent 路由 + 子 Agent 串行执行 + 汇总合成。
+- **ContextBuilder**：GraphState 存事实，ContextBuilder 在每次 LLM 调用前按 Agent 策略裁剪并组装 `messages`（不把 prompt 长期塞进 State）。
+- **Tool-Calling（MCP 模式 A）**：子 Agent 经 `mcp_gateway` 调用本地/外网 MCP；工具白名单见 `mcp_server_service.py`。
+- **会话记忆**：Redis 热缓存近 10 轮 + ES Episodic 全量归档；加载时 Redis 优先，缺失则 ES 回填。
+- **证据传递**：检索类工具结果写入 `evidence_packets`，供综述子 Agent 与最终汇总使用。
+- **PDF 流水线**：上传 → Kafka → Worker（Docling 解析、Parent-Child 切分、索引）。
+
+---
+
+## 上下文与记忆如何传递
+
+### GraphState（黑板）存什么
+
+| 字段 | 含义 |
+|------|------|
+| `query` | 当前用户问题（原始一句） |
+| `history_messages` | 本轮之前的会话 `[{role, content}, ...]`（最多 10 条 message） |
+| `conversation_context` | 路由后写入：`standalone_query`、`resolved_entities`、`context_requirements` |
+| `decision` | 主 Agent JSON：目标子 Agent、各阶段任务、调度原因等 |
+| `agent_results` | 已执行子 Agent 的输出列表（供下游与汇总） |
+| `evidence_packets` | 检索工具返回的结构化证据 |
+| `context` | 运行参数：`session_id`、`task_id`、`top_k` 等 |
+
+**不**在 State 里持久化拼好的 `router_messages` / `summary_messages`（仅为 LLM 临时产物）。
+
+### ContextBuilder 各阶段默认策略
+
+| 阶段 / Agent | 会话历史条数 | standalone_query | 上游 agent_results | evidence_packets |
+|--------------|-------------|------------------|-------------------|------------------|
+| Router | **10** | — | — | — |
+| retrieval-agent | 0 | ✅ | ❌ | ❌ |
+| writing-agent | 2 | ✅ | ✅ | ❌ |
+| summary-agent（子） | 0 | ❌ | ✅ | ✅ |
+| profile-agent | 0 | ✅ | ❌ | ❌ |
+| **最终汇总** | **4** | 展示在 Human 中 | ✅ 全部 | ✅ |
+
+主 Agent 可在 `context_requirements` 里为各子 Agent **建议**覆盖项；实际裁剪由 `ContextBuilder` + `policies.py` 合并执行。
+
+### 记忆读写路径（Agent 对话）
+
+```
+请求带 session_id
+  → SessionStore.load_history_messages（Redis 近 10 轮，完整 content）
+  → Redis 空则 ES Episodic 回填 Redis
+  → 写入 state.history_messages + context.history_messages
+  → 各阶段 ContextBuilder 按策略注入 messages
+  → 对话结束写回 Redis + ES（user/assistant 各一条 turn）
+```
+
+Agent 路径 **不使用** MySQL `ChatHistoryService`（该模块为可选/遗留 API，默认未接入 `/agent/chat`）。
+
+### 子 Agent 之间如何传递
+
+串行流水线：后一个子 Agent 的 Human 消息中，在策略允许时包含 **上游 `agent_results` 全文**；检索工具结果 additionally 进入 **`evidence_packets`**。用户 SSE 仅展示 **汇总节点** 的流式输出，不展示各子 Agent 中间原文。
+
+---
+
+## LangGraph 工作流
+
+```
+START → main_agent_node
+           │  写入 decision + conversation_context
+           ├─ direct_answer → direct_answer_node → END
+           └─ dispatch → execute_sub_agent_node（按 CANONICAL_AGENT_ORDER 循环）
+                              │
+                              ├─ 还有待执行 → 继续 execute_sub_agent_node
+                              ├─ pending_task → suspend_node → END
+                              └─ 完成 → summarize_node → END
+```
+
+子 Agent 固定顺序：`retrieval-agent` → `writing-agent` → `summary-agent` → `profile-agent`（仅执行 `target_agents` 中的项）。
+
+---
 
 ## 目录结构
 
 ```
 PaperMind_multiAgent/
 ├── app/
-│   ├── main.py                         # FastAPI 入口
-│   ├── core/
-│   │   ├── config.py                   # 统一配置
-│   │   ├── logging.py                  # 日志配置
-│   │   └── schemas.py                  # 通用数据模型
-│   ├── agent/                          # Agent 系统
-│   │   ├── agents/                     # 6 个 Agent 定义
-│   │   │   ├── main_agent.py           # 意图路由编排器
-│   │   │   ├── retrieval_agent.py      # 论文检索 Agent
-│   │   │   ├── writing_agent.py        # 学术写作 Agent
-│   │   │   ├── summary_agent.py        # 文献综述 Agent
-│   │   │   ├── profile_agent.py        # 论文发现 Agent
-│   │   │   └── chat_agent.py           # 统一回答合成 Agent
-│   │   ├── graphs/                     # LangGraph 工作流
-│   │   │   ├── paper_mind_graph.py     # StateGraph 装配
-│   │   │   └── graph_state.py          # AgentState TypedDict
-│   │   ├── schemas/                    # Agent 专用 schema
-│   │   └── tools/                      # Agent 可调用的工具
-│   │       ├── mcp_adapter.py          # MCP → LangChain 工具适配
-│   │       └── registry.py             # Agent 工具白名单（模式 A）
-│   ├── mcp_servers/
-│   │   └── papermind_retrieval/        # 本地检索 MCP Server
-│   ├── mcp_gateway/                    # MCP 网关（鉴权/路由/执行）
-│   ├── api/
-│   │   ├── v1/
-│   │   │   ├── router.py               # /api/v1 路由聚合
-│   │   │   ├── agent_routes.py         # Agent 对话 (chat + SSE)
-│   │   │   ├── sessions.py             # 会话 CRUD
-│   │   │   ├── upload.py               # PDF 上传 (含分片)
-│   │   │   └── task_routes.py          # 任务状态查询
-│   │   ├── chat_api.py                 # 聊天接口
-│   │   ├── task_api.py                 # 任务管理
-│   │   └── workflow_api.py             # 工作流管理
+│   ├── main.py                      # FastAPI 入口
+│   ├── core/                        # 配置、日志、通用 schema
+│   ├── middleware/                  # 请求日志中间件
+│   ├── observability/               # 业务事件枚举等
+│   ├── agent/
+│   │   ├── agents/                  # main + 4 子 Agent 定义
+│   │   ├── context/                 # ContextBuilder、策略、格式化
+│   │   │   ├── builder.py
+│   │   │   ├── policies.py
+│   │   │   ├── formatters.py
+│   │   │   └── types.py
+│   │   ├── graphs/
+│   │   │   ├── paper_mind_graph.py  # LangGraph 装配
+│   │   │   └── graph_state.py       # PaperMindState
+│   │   └── tools/                   # MCP → LangChain 适配、工具注册
+│   ├── mcp_gateway/                 # MCP 网关
+│   ├── mcp_servers/                 # 本地 papermind-retrieval 等
+│   ├── api/v1/                      # agent、sessions、papers、task、mcp
 │   ├── services/
-│   │   ├── storage/                    # 基础设施封装
-│   │   │   ├── es.py                   # Elasticsearch 客户端
-│   │   │   ├── redis.py                # Redis 客户端
-│   │   │   ├── kafka.py                # Kafka 生产者
-│   │   │   ├── embedding.py            # Embedding 后端
-│   │   │   └── docstore.py             # ES 文档存储
-│   │   ├── memory/                     # 三层记忆系统
-│   │   │   ├── session_store.py        # Redis 会话记忆
-│   │   │   ├── episodic.py             # ES 情景记忆
-│   │   │   ├── semantic.py             # ES 语义记忆
-│   │   │   ├── consolidation.py        # 记忆固化
-│   │   │   └── manager.py              # 统一编排
-│   │   ├── papers/                     # 论文服务
-│   │   │   ├── search.py               # 论文搜索
-│   │   │   ├── profile.py              # 论文画像
-│   │   │   └── index.py                # 论文索引
-│   │   ├── retrieval.py                # 混合检索 BM25+kNN+RRF
-│   │   ├── qa.py                       # RAG 问答链
-│   │   ├── docling.py                  # PDF 解析
-│   │   ├── indexing.py                 # 切分与索引
-│   │   ├── agent_executor_service.py   # 子 Agent 执行 (tool-calling)
-│   │   ├── chat_workflow_service.py    # 对话工作流 + SSE 门面
-│   │   ├── mcp_server_service.py       # MCP Server 目录 + Agent 工具白名单
-│   │   ├── mcp_bridge.py               # MCP 桥接 (兼容层)
-│   │   ├── orchestrator_service.py     # Run / 异步任务编排
-│   │   └── llm_service.py              # LLM 客户端工厂
-│   ├── shared/                         # 工具函数
-│   └── workers/
-│       └── consumer.py                 # Kafka 消费 Worker
-├── frontend/                           # Vite + React 前端
-│   └── src/
-│       ├── api/papers.ts               # 所有 API 调用封装
-│       ├── types/api.ts                # TypeScript 类型定义
-│       ├── components/
-│       │   ├── ChatPanel.tsx           # 聊天助手面板
-│       │   ├── KnowledgeBasePanel.tsx  # 知识库管理
-│       │   ├── RecordsPanel.tsx        # 聊天记录面板
-│       │   └── SourcesPanel.tsx        # 引用来源侧栏
-│       └── utils/                      # 工具函数
-├── docker-compose.yml                  # 本地基础设施
+│   │   ├── chat_workflow_service.py # SSE 门面 + 图执行
+│   │   ├── agent_executor_service.py
+│   │   ├── summary_service.py
+│   │   ├── orchestrator_service.py
+│   │   ├── memory/                  # session_store、episodic、semantic
+│   │   ├── storage/                 # es、redis、kafka、embedding
+│   │   ├── papers/                  # 搜索、画像、索引
+│   │   ├── retrieval.py / qa.py
+│   │   └── ...
+│   └── workers/consumer.py          # PDF 解析 Worker
+├── frontend/                        # Vite + React
+├── scripts/
+│   ├── test_context_builder.py      # ContextBuilder 单元测试
+│   └── test_memory_injection.py     # Redis/ES 记忆集成测试
+├── log/                             # 按日期分目录的 JSON 日志
+├── docker-compose.yml
 ├── requirements.txt
 └── .env.example
 ```
 
+---
+
 ## API 入口
 
+| Endpoint | 用途 |
+|----------|------|
+| `GET /health` | 健康检查（ES / Redis / Kafka / MinIO / MySQL） |
+| `POST /api/v1/sessions` | 创建会话 |
+| `GET /api/v1/sessions` | 会话列表 |
+| `GET /api/v1/sessions/{id}/history` | 恢复对话历史 |
+| `DELETE /api/v1/sessions/{id}` | 删除会话 |
+| `POST /api/v1/agent/chat` | Agent 对话（JSON） |
+| `POST /api/v1/agent/chat/stream` | Agent SSE 流式 |
+| `POST /api/v1/papers/upload` | 上传 PDF |
+| `GET /api/v1/papers/{task_id}` | 任务状态 |
+| `GET /api/v1/mcp/servers` | MCP Server 列表 |
+| `POST /api/v1/mcp/tools/call` | 调试调用 MCP 工具 |
 
-| Endpoint                                 | 用途                                    |
-| ---------------------------------------- | ------------------------------------- |
-| `GET /health`                            | 健康检查（含 ES/Redis/Kafka/MinIO/MySQL 探活） |
-| `POST /api/v1/sessions`                  | 创建新会话                                 |
-| `GET /api/v1/sessions`                   | 会话列表                                  |
-| `DELETE /api/v1/sessions/{id}`           | 删除会话                                  |
-| `GET /api/v1/sessions/{id}/history`      | 恢复会话完整对话历史                            |
-| `POST /api/v1/agent/chat`                | **Agent 研究助手（统一问答入口）**                |
-| `POST /api/v1/agent/chat/stream`         | Agent SSE 流式回答                        |
-| `POST /api/v1/papers/upload`             | 上传 PDF 并投递解析任务                        |
-| `POST /api/v1/papers/upload/multipart/`* | 分片上传大 PDF                             |
-| `GET /api/v1/papers`                     | 查看最近任务                                |
-| `GET /api/v1/papers/{task_id}`           | 查询任务状态                                |
-| `DELETE /api/v1/papers/{task_id}`        | 删除任务及相关存储                             |
-| `DELETE /api/v1/papers/batch`            | 批量删除任务                                |
-| `GET /api/v1/mcp/servers`                | 列出已配置的 MCP Server                     |
-| `GET /api/v1/mcp/tools`                  | 列出已发现的 MCP 工具                         |
-| `POST /api/v1/mcp/tools/call`            | 经 Gateway 调用任意 MCP 工具（调试/集成）          |
+Swagger：`http://localhost:2222/docs`
+
+---
+
+## 子 Agent 工具能力（摘要）
+
+配置：`app/services/mcp_server_service.py` → `AGENT_TOOL_ALLOWLIST`。
 
 
-## Agent 架构
+| 子 Agent | MCP | 能力摘要 |
+|----------|-----|----------|
+| retrieval-agent | 本地 + **外网** | `search_papers`、`retrieve_evidence`、`answer_with_rag`、arXiv/PubMed 等 |
+| profile-agent | 本地 | `search_papers`、`get_paper_profile` |
+| summary-agent | 本地 | `retrieve_evidence`、`answer_with_rag` |
+| writing-agent | 本地 | `retrieve_evidence`、`answer_with_rag`（事实核查） |
 
-### 一次对话里发生了什么
+外网 MCP（`paper-search`）**仅**分配给检索 Agent。
 
-```
-用户提问
-    │
-    ▼
-┌─────────────────────────────────────────────────────────┐
-│ Main Agent：判断意图，生成执行计划（派哪些子 Agent、顺序）   │
-└────────────────────────────┬────────────────────────────┘
-                             │
-     ┌───────────────────────┼───────────────────────┐
-     ▼                       ▼                       ▼
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    …
-│ 检索 Agent   │    │ 发现 Agent   │    │ 综述 Agent   │
-│ 找论文/证据  │    │ 列表+画像    │    │ 写综述       │
-│ (+外网可选)  │    │              │    │              │
-└──────┬──────┘    └──────┬──────┘    └──────┬──────┘
-       │                  │                  │
-       └──────────────────┴──────────────────┘
-                             │
-                             ▼
-              summarize_node：合并各阶段结果
-                             │
-                             ▼
-              用户看到一条流式最终回答（SSE）
+---
+
+## Quick Start
+
+### 1. 基础设施
+
+```bash
+docker compose up -d
 ```
 
-- **检索 Agent**：知识库混合检索（BM25 + 向量 + RRF）、RAG 问答；需要时调用外网 MCP（arXiv / PubMed 等）。
-- **发现 Agent**：`search_papers` / `get_paper_profile`，偏「有哪些论文、某篇讲什么」。
-- **综述 Agent**：在上游检索证据基础上组织综述结构；证据不足时可自行补检索。
-- **写作 Agent**：润色与审稿为主；需要事实依据时再调检索类工具。
-- **直接回答**：问候、闲聊等与学术任务无关时，主 Agent 不派子 Agent。
+| 服务 | 宿主机端口 | 说明 |
+|------|-----------|------|
+| MinIO | 9000 / 控制台 9001 | PDF 对象存储 |
+| Redis | **6380** → 容器 6379 | 会话热记忆（避免与本机 6379 冲突） |
+| Kafka | 9092 | 解析任务队列 |
+| Elasticsearch | **9201** → 容器 9200 | 检索 + 记忆索引 |
+| MySQL | 3307 → 容器 3306 | 可选持久化 |
 
-### LangGraph 图结构
+### 2. Python 环境（推荐 conda `papermind`）
 
-```
-START → main_agent_node
-            │
-            ├─ dispatch → execute_sub_agent_node（按 selected_agents 循环）
-            │                  │
-            │                  ├─ 还有待执行 Agent → 继续 execute_sub_agent_node
-            │                  ├─ suspend → suspend_node → END
-            │                  └─ 完成 → summarize_node → END
-            │
-            ├─ direct_answer → direct_answer_node → END
-            └─ summarize → summarize_node → END
+```bash
+conda activate papermind
+pip install -r requirements.txt
+cp .env.example .env
+# 编辑 .env：REDIS_URL=redis://localhost:6380/2、DASHSCOPE_API_KEY、ES_HOSTS 等
 ```
 
-### 子 Agent 与工具能力对照
+### 3. 启动服务
 
-下表说明各子 Agent **实际能调用的 MCP 工具**（模式 A：经 `mcp_gateway` 统一执行）。配置入口：`app/services/mcp_server_service.py` → `AGENT_TOOL_ALLOWLIST`。
+```bash
+# 后端（默认端口 2222，见 app/core/config.py）
+uvicorn app.main:app --reload --host 0.0.0.0 --port 2222
 
+# 前端
+cd frontend && npm install && npm run dev
 
-| 子 Agent      | 主要职责（给用户）            | MCP Server  | 工具能力摘要                                                                                                                                                                                                                 |
-| ------------ | -------------------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **检索 Agent** | 知识库检索、证据片段、RAG；外网查文献 | 本地 + **外网** | 本地：`retrieve_evidence`、`retrieve_with_mqe`、`answer_with_rag`、`search_papers`、`deep_search_papers`、`get_paper_profile`；外网：`search_arxiv`、`search_pubmed`、`search_biorxiv`、`search_google_scholar`、`download_`*、`read_*` |
-| **发现 Agent** | 推荐论文列表、单篇结构化画像       | 仅本地         | `search_papers`、`deep_search_papers`、`get_paper_profile`                                                                                                                                                               |
-| **综述 Agent** | 文献综述与领域梳理            | 仅本地         | `retrieve_evidence`、`answer_with_rag`                                                                                                                                                                                  |
-| **写作 Agent** | 润色、审稿、写作辅助           | 仅本地         | `retrieve_evidence`、`answer_with_rag`（作事实核查）                                                                                                                                                                           |
-| **主 Agent**  | 路由与拆任务               | —           | 不绑定工具                                                                                                                                                                                                                  |
+# PDF 解析 Worker（另开终端）
+python -m app.workers.consumer
+```
 
+前端：`http://localhost:5173`
 
-> **外网 MCP**（`paper-search`）只分配给 **检索 Agent**，其它子 Agent 仅访问已上传并索引到 ES 的知识库。
+### 4. 自检脚本
 
-**工具调用路径（实现细节）：** 子 Agent `bind_tools` → `mcp_adapter` → `mcp_gateway` → `papermind-retrieval` / `paper-search` → 领域服务 / 外部 API → 结果回填 LLM。
+```bash
+conda activate papermind
 
-**事实性约束：** 涉及论文数据时必须走工具，禁止编造；汇总节点只向用户推送**一条**最终流式回答，避免检索阶段与汇总阶段重复刷屏。
+# ContextBuilder 逻辑（无需 Redis）
+python scripts/test_context_builder.py
 
-### 接入新的 MCP Server
+# 记忆 Redis → ES 回填（需 Redis + ES）
+python scripts/test_memory_injection.py
+```
 
-1. 在 `app/mcp_gateway/server_manager.py` 的 `SERVER_MODULES` 注册模块路径。
-2. 在 `app/services/mcp_server_service.py` 增加 `MCPServerConfig` 与 `AGENT_TOOL_ALLOWLIST`。
-3. 重启服务；`lifespan` 会 `mcp_server_manager.refresh()` 自动发现工具。
+---
 
 ## 演示请求
 
 ```bash
-# 1. 创建新会话
+# 创建会话
 curl -X POST http://localhost:2222/api/v1/sessions
-# → {"session_id": "abc123", ...}
 
-# 2. 多 Agent 检索对话
+# 检索对话（替换 session_id）
 curl -X POST http://localhost:2222/api/v1/agent/chat \
   -H "Content-Type: application/json" \
-  -d '{"query":"帮我找几篇关于水下图像增强的论文，并说明依据","session_id":"abc123","top_k":5}'
+  -d '{"query":"知识库里有哪些关于水下图像增强的论文？","session_id":"<sid>","top_k":5}'
 
-# 3. 多轮追问
+# 多轮追问（依赖 session 记忆 + standalone_query）
 curl -X POST http://localhost:2222/api/v1/agent/chat \
   -H "Content-Type: application/json" \
-  -d '{"query":"第一篇的方法是什么？","session_id":"abc123"}'
-
-# 4. 学术润色
-curl -X POST http://localhost:2222/api/v1/agent/chat \
-  -H "Content-Type: application/json" \
-  -d '{"query":"请帮我润色以下学术文本：...","session_id":"abc123"}'
+  -d '{"query":"它的方法有什么不足？","session_id":"<sid>"}'
 ```
 
-响应示例：
-
-```json
-{
-  "query": "帮我找几篇关于水下图像增强的论文",
-  "answer": "根据知识库检索结果，找到以下相关论文：\n\n1. ...",
-  "contexts": [...],
-  "sources": [{ "paper_id": "...", "title": "...", "score": 0.92 }],
-  "used_tools": ["search_papers", "retrieve_evidence"]
-}
-```
-
-## 基础设施
-
-
-| 服务            | 宿主机地址               | 说明                          |
-| ------------- | ------------------- | --------------------------- |
-| MinIO         | `9000` / 控制台 `9001` | PDF / Markdown 对象存储         |
-| Redis         | `6379`              | 会话记忆 + 上传状态                 |
-| Kafka         | `9092`              | 解析任务队列 (KRaft, 无 Zookeeper) |
-| Elasticsearch | `9201` → 容器 `9200`  | 父/子块 + 论文索引 + 记忆            |
-| MySQL         | `3307` → 容器 `3306`  | 聊天历史 (可选，默认启用)              |
-
-
-## Quick Start
+流式：
 
 ```bash
-# 1. 启动基础设施
-docker compose up -d
-
-# 2. 安装依赖
-pip install -r requirements.txt
-
-# 3. 配置环境变量
-cp .env.example .env
-# 编辑 .env：填入 DASHSCOPE_API_KEY、OPENAI_API_KEY 等
-
-# 4. 启动后端
-uvicorn app.main:app --reload --host 0.0.0.0 --port 2222
-
-# 5. 启动前端 (新终端)
-cd frontend && npm install && npm run dev
-
-# 6. 启动 Worker (新终端，用于 PDF 解析)
-python -m app.workers.consumer
+curl -N -X POST http://localhost:2222/api/v1/agent/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"query":"你好","session_id":"<sid>"}'
 ```
 
-访问 `http://localhost:5173` 进入前端界面。
+---
 
-## 仓库分支说明
+## 日志
 
-本仓库在 GitHub 上可能同时存在以下分支，用途不同：
+双通道输出（见 `app/core/logging.py`）：
+
+- **stdout**：开发可读文本
+- **`log/YYYY/MM/DD/`**：`app.json.log`、`agent.json.log`、`audit.json.log`
+
+环境变量（`.env`）：
+
+| 变量 | 说明 |
+|------|------|
+| `LOG_DIR` | 默认 `log` |
+| `LOG_JSON_TO_FILE` | 是否写 JSON 文件 |
+| `LOG_AGENT_BUSINESS_FILE` | 是否写 agent 业务日志 |
+| `LOG_LLM_PAYLOADS` | 是否记录 LLM 请求体（调试用） |
+
+---
+
+## 接入新 MCP Server
+
+1. 在 `app/mcp_gateway/server_manager.py` 注册 `SERVER_MODULES`
+2. 在 `app/services/mcp_server_service.py` 增加 `MCPServerConfig` 与 `AGENT_TOOL_ALLOWLIST`
+3. 重启 API；`lifespan` 会 `mcp_server_manager.refresh()` 发现工具
+
+---
+
+## 仓库分支
 
 
-| 分支            | 说明                                                                 |
-| ------------- | ------------------------------------------------------------------ |
-| `main`        | **当前主开发分支**，包含 Multi-Agent 编排、MCP 模式 A、前端流式对话等最新代码。克隆仓库后默认即为此分支。   |
-| `legacy-main` | **历史备份分支**，保留升级前的单 Agent 版 PaperMind 代码与提交历史，仅供对照或回查，**不是**日常开发起点。 |
-
-
-### 克隆与切换
+| 分支 | 说明 |
+|------|------|
+| `main` | 当前主开发分支（Multi-Agent + MCP + ContextBuilder） |
+| `legacy-main` | 升级前单 Agent 备份，仅供对照 |
 
 ```bash
-# 默认克隆 main（推荐）
 git clone https://github.com/beforgeted/PaperMind.git
 cd PaperMind
-
-# 如需查看旧版单 Agent 代码
-git fetch origin
-git checkout legacy-main
+# 默认 main；查看旧版：git checkout legacy-main
 ```
 
-### 注意事项
+两套分支历史相互独立，请勿随意 `merge`。
 
-- `git clone` 只会检出默认分支（`main`），不会自动下载 `legacy-main` 的工作区内容；但在 GitHub 网页的 **Branches** 列表中仍能看到 `legacy-main`。
-- 两套分支的 Git 历史相互独立（无共同祖先），请勿对 `main` 执行与 `legacy-main` 的普通 `merge`，除非明确要做历史合并。
-- 新贡献者请以 `main` 为准阅读 README 与提交 PR。
+---
 
+## 相关文档
+
+- 设计规格：`docs/superpowers/specs/2026-06-04-papermind-multi-agent-transform-design.md`
+- 实施计划：`docs/superpowers/plans/2026-06-04-papermind-multi-agent-transform-plan.md`
